@@ -159,6 +159,13 @@ namespace WatchDog
             // 顶部标题条
             header = new BufferedPanel(); header.Dock = DockStyle.Top; header.Height = 50;
             header.Paint += PaintHeader;
+            header.MouseMove += delegate(object s, MouseEventArgs e)
+            {
+                string hit = LinkAt(e.Location);
+                if (hit != hoverLink) { hoverLink = hit; header.Cursor = hit != null ? Cursors.Hand : Cursors.Default; header.Invalidate(); }
+            };
+            header.MouseLeave += delegate { if (hoverLink != null) { hoverLink = null; header.Cursor = Cursors.Default; header.Invalidate(); } };
+            header.MouseClick += delegate(object s, MouseEventArgs e) { string url = LinkAt(e.Location); if (url != null) StartShell(url, ""); };
 
             // 三张卡片（点击切换下方走势图）：内存占一半宽，CPU、磁盘各四分之一
             cards = new BufferedPanel(); cards.Dock = DockStyle.Top; cards.Height = 136; cards.BackColor = cBg;
@@ -229,6 +236,15 @@ namespace WatchDog
             };
         }
 
+        static readonly string[][] Links = { new[] { "YIFANOVO.COM", "https://yifanovo.com" }, new[] { "GITHUB // WATCHDOG", "https://github.com/yifanwow/watchDog" } };
+        List<object[]> linkRects = new List<object[]>();   // [x0, x1, url]
+        string hoverLink;
+        string LinkAt(Point p)
+        {
+            if (p.Y < 12 || p.Y > 36) return null;
+            foreach (object[] r in linkRects) if (p.X >= (int)r[0] && p.X < (int)r[1]) return (string)r[2];
+            return null;
+        }
         Panel Spacer(int h, DockStyle dock = DockStyle.Top) { Panel p = new Panel(); p.Dock = dock; p.Height = h; p.BackColor = cBg; return p; }
 
         // ---------- 标题条 ----------
@@ -254,8 +270,21 @@ namespace WatchDog
             int[] sig = { 6, 10, 14, 18, 22 };
             int lit = 3 + tick % 3;
             for (int i = 0; i < sig.Length; i++) g.FillRectangle(i < lit ? bLv[0] : bDim, 534 + i * 7, 36 - sig[i], 4, sig[i]);
-            string selfTxt = string.Format("本窗口 {0:N0} MB · CPU {1:N1}% · GDI {2}", selfMB, selfCpu, selfGdi);
-            int rx = w - 262, rw = Math.Max(120, rx - 590);
+            string selfTxt = string.Format("本窗口 {0:N0} MB · CPU {1:N1}%", selfMB, selfCpu);
+            // 两个跳转链接：个人主页 / 软件主页
+            int lx = 596; List<object[]> lr = new List<object[]>();
+            foreach (string[] k in Links)
+            {
+                int lw = TxtW(g, k[0], fTagB) + 30;
+                bool hot = hoverLink == k[1];
+                g.FillPolygon(hot ? bLv[0] : bDeep, new[] { new PointF(lx + 6, 12), new PointF(lx + lw, 12), new PointF(lx + lw - 6, 36), new PointF(lx, 36) });
+                g.DrawPolygon(hot ? pCyanThin : pAcc, new[] { new PointF(lx + 6, 12), new PointF(lx + lw, 12), new PointF(lx + lw - 6, 36), new PointF(lx, 36) });
+                Txt(g, "↗", fCN, hot ? cBg : cAccent, lx + 9, 12, 14, 24);
+                Txt(g, k[0], fTagB, hot ? cBg : cCyan, lx + 22, 12, lw - 24, 24);
+                lr.Add(new object[] { lx, lx + lw, k[1] }); lx += lw + 8;
+            }
+            linkRects = lr;
+            int rx = w - 262, rw = Math.Max(120, rx - lx - 10);
             Txt(g, "SELF // 自身占用", fSmall, cRedDim, rx - rw, 6, rw - 4, 16, tfR);
             Txt(g, selfTxt, fCN, cCyan, rx - rw, 22, rw - 4, 18, tfR);
             g.FillRectangle(bDimLine, rx + 4, 12, 1, 26);
