@@ -1,21 +1,26 @@
 ﻿# MemMonitor：内存 / CPU / 磁盘 监控面板（赛博朋克风格界面：红黑底 + 荧光蓝）
 # 和任务管理器的区别：不只看"现在谁占得多"，而是看"谁在变坏、为什么、怎么修"——
-#   1. 稳定性评级：用看门狗记录的 24 小时历史，判断每个程序是稳定、波动、缓慢上涨还是疑似泄漏，并预测 24 小时后的占用
+#   1. 稳定性评级：窗口打开 10 分钟后用实时数据给出初步判断；看门狗记录满 1 小时后给出长期判断（含疑似泄漏）
 #   2. 问题规则库：rules.json（公共）+ rules.local.json（自己的）写明"症状 → 原因 → 修复方法"，命中就给出修复按钮
-# 只在打开时运行，关掉窗口就完全退出。每 5 秒刷新一次，只保留最新一份数据，不会越用越大。
+# 只在打开时运行，关掉窗口就完全退出。每 5 秒刷新一次。
+# 实时数据存在固定大小的环形缓存里（每条最多 1 小时 / 720 个点，最多 150 条），不会越用越大。
 # 所有画笔 / 画刷 / 字体只在启动时创建一次；系统句柄（进程、磁盘计数器）用完立即关闭；图标缓存有上限。
-#   -SelfTest -Loops N [-Snapshot x.png] [-Select 程序名] : 在屏幕外显示窗口，连续刷新并重绘 N 次，打印结果和自身资源
+#   -SelfTest -Loops N [-Snapshot x.png] [-Select 程序名] [-StartChart mem|cpu|disk|dog|proc] : 在屏幕外显示窗口，连续刷新并重绘 N 次
 param(
     [string]$DataDir = (Join-Path $PSScriptRoot 'data'),
     [string]$RulesDir = $PSScriptRoot,
     [switch]$SelfTest,
     [int]$Loops = 1,
     [string]$Snapshot,
-    [string]$Select
+    [string]$Select,
+    [string]$StartChart = 'proc',
+    [int]$SimMinutes = 0,         # 仅自测：预先填入最近 N 分钟的模拟实时数据
+    [string]$SimRising = ''       # 仅自测：让这个程序在模拟数据里持续上涨
 )
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName Microsoft.VisualBasic
 Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
 using System;
 using System.Text;
@@ -39,6 +44,7 @@ public static class NativeInfo {
     [DllImport("kernel32.dll")] static extern bool GetProcessIoCounters(IntPtr h, out IO_COUNTERS c);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder sb, ref int size);
     [DllImport("user32.dll")] public static extern uint GetGuiResources(IntPtr h, uint flags);
+    [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] public static extern int SetWindowTheme(IntPtr h, string app, string id);
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
@@ -93,6 +99,44 @@ public static class DiskPerf {
     }
     public static void Close() { if (q != IntPtr.Zero) { PdhCloseQuery(q); q = IntPtr.Zero; } }
 }
+// 固定大小的环形缓存：满了就覆盖最旧的点，所以内存占用有上限。
+public class Ring {
+    long[] t; float[] v; int head, n, cap;
+    public DateTime LastSeen;
+    public Ring(int capacity) { cap = capacity; t = new long[cap]; v = new float[cap]; }
+    public void Add(DateTime when, double val) {
+        int i;
+        if (n < cap) { i = (head + n) % cap; n++; } else { i = head; head = (head + 1) % cap; }
+        t[i] = when.Ticks; v[i] = (float)val; LastSeen = when;
+    }
+    public int Count { get { return n; } }
+    public long TimeAt(int k) { return t[(head + k) % cap]; }
+    public float ValueAt(int k) { return v[(head + k) % cap]; }
+    // 内存趋势（只看最近一次重启之后：值骤降 40% 以上或断档超过 gapSec 秒视为重启）
+    // 返回 [每小时变化 MB, R², 累计变化, 时长(小时), 波动系数, 点数]；数据不够返回 null
+    public double[] Stats(double gapSec) {
+        if (n < 3) return null;
+        int s = 0;
+        for (int k = 1; k < n; k++) {
+            if (ValueAt(k) < 0.6 * ValueAt(k - 1) || (TimeAt(k) - TimeAt(k - 1)) / 1e7 > gapSec) s = k;
+        }
+        int m = n - s;
+        if (m < 3) return null;
+        double t0 = TimeAt(s), sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+        for (int k = s; k < n; k++) {
+            double x = (TimeAt(k) - t0) / 36e9, y = ValueAt(k);
+            sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y;
+        }
+        double span = (TimeAt(n - 1) - t0) / 36e9;
+        double den = m * sxx - sx * sx;
+        if (den <= 0) return null;
+        double num = m * sxy - sx * sy, vy = m * syy - sy * sy;
+        double r2 = vy > 0 ? (num * num) / (den * vy) : 0;
+        double mean = sy / m;
+        double cv = mean > 0 ? Math.Sqrt(Math.Max(0, syy / m - mean * mean)) / mean : 0;
+        return new double[] { num / den, r2, ValueAt(n - 1) - ValueAt(s), span, cv, m };
+    }
+}
 public class BufferedPanel : Panel { public BufferedPanel() { DoubleBuffered = true; ResizeRedraw = true; } }
 public class BufferedListView : ListView { public BufferedListView() { DoubleBuffered = true; } }
 public class CyberColors : ProfessionalColorTable {
@@ -139,14 +183,16 @@ $Desc = @{
 }
 
 # 稳定性判断标准
-$LeakSlopeMBh = 50     # 疑似泄漏：每小时至少涨 50 MB
-$LeakGrowthMB = 300    #           累计至少涨 300 MB
-$LeakR2       = 0.6    #           涨势稳定（不是忽高忽低）
-$RiseSlopeMBh = 15     # 缓慢上涨：每小时至少涨 15 MB
-$RiseGrowthMB = 100    #           累计至少涨 100 MB
-$RiseR2       = 0.5
+# 长期（看门狗记录 ≥ 1 小时）
+$LeakSlopeMBh = 50; $LeakGrowthMB = 100; $LeakR2 = 0.6     # 疑似泄漏
+$RiseSlopeMBh = 15; $RiseGrowthMB = 40;  $RiseR2 = 0.5     # 缓慢上涨
+# 短期（窗口实时数据 ≥ 10 分钟）：只给初步判断，不下"泄漏"结论
+$ShortMinHours = 10 / 60
+$ShortSlopeMBh = 60; $ShortGrowthMB = 30; $ShortR2 = 0.8   # 短时上涨
 $WobbleCv     = 0.15   # 波动大：波动幅度超过平均值的 15%
 $HeavyIoMBs   = 30     # 单个程序读写超过这个速度会提示
+$RingSize     = 720    # 每条实时数据最多 720 个点（5 秒一个 = 1 小时）
+$MaxSeries    = 150    # 最多同时记录 150 条
 
 # ---------- 状态（每次刷新都整体替换，不累积） ----------
 $script:prevCpu   = @{}; $script:prevIo = @{}; $script:prevTime = $null; $script:denied = @{}
@@ -154,20 +200,23 @@ $script:cpuHist   = New-Object 'System.Collections.Generic.Queue[double]'
 $script:hist      = @{}; $script:analysis = @{}; $script:sys = @(); $script:histSig = ''
 $script:lastSlow  = [datetime]::MinValue; $script:forceSlowAt = $null
 $script:svcPid    = @{}; $script:taskState = $null; $script:lastAction = ''
-$script:rules     = @(); $script:rulesSig = ''; $script:fileMB = @{}
+$script:rules     = @(); $script:rulesSig = ''; $script:fileMB = @{}; $script:watched = @{}
 $script:hits      = @(); $script:hitByTarget = @{}
 $script:selected  = if ($Select) { $Select } else { $null }
+$script:chartMode = $StartChart; $script:chartRange = 'auto'; $script:rangeRects = @()
 $script:updating  = $false; $script:tick = 0; $script:sortMode = 'issue'
 $script:selfMB = 0; $script:selfGdi = 0; $script:selfCpu = 0.0; $script:selfPrevCpu = $null
 $script:issues    = @(); $script:verdict = @('正在检查…', -1, ''); $script:issueRects = @()
 $script:rows = @{}; $script:ratings = @{}; $script:disk = @(0, 0, 0)
+$script:series    = @{}   # 实时数据：名字 -> Ring（程序内存，以及 sys:mem / sys:cpu / sys:dr / sys:dw / sys:self）
 $script:icons     = @{}   # 程序名 -> 32px 图标（Bitmap 或 $null），上限 150 个
+$script:ignores   = @{}; $script:ignoreSig = $null   # 用户忽略 / 确认正常的问题
 
 # ---------- 数据 ----------
+# 看门狗历史（10 分钟一个点）的趋势，至少 1 小时
 function Analyze($pts) {
     $n = $pts.Count
     if ($n -lt 6) { return $null }
-    # 只看最近一次重启（内存骤降或断档超过 1 小时）之后的数据
     $start = 0
     for ($i = 1; $i -lt $n; $i++) {
         if ($pts[$i].MB -lt 0.6 * $pts[$i - 1].MB -or ($pts[$i].T - $pts[$i - 1].T).TotalMinutes -gt 60) { $start = $i }
@@ -176,7 +225,7 @@ function Analyze($pts) {
     if ($m -lt 6) { return $null }
     $t0 = $pts[$start].T
     $span = ($pts[$n - 1].T - $t0).TotalHours
-    if ($span -lt 2) { return $null }
+    if ($span -lt 1) { return $null }
     $sx = 0.0; $sy = 0.0; $sxx = 0.0; $sxy = 0.0; $syy = 0.0
     for ($i = $start; $i -lt $n; $i++) {
         $x = ($pts[$i].T - $t0).TotalHours; $y = $pts[$i].MB
@@ -195,7 +244,7 @@ function Analyze($pts) {
 function Load-History {
     if (-not (Test-Path $DataDir)) { $script:hist = @{}; $script:analysis = @{}; $script:sys = @(); return }
     $pf = @(Get-ChildItem $DataDir -Filter 'proc-*.csv' | Sort-Object Name | Select-Object -Last 2)
-    $sf = @(Get-ChildItem $DataDir -Filter 'sys-*.csv'  | Sort-Object Name | Select-Object -Last 2)
+    $sf = @(Get-ChildItem $DataDir -Filter 'sys*.csv' | Sort-Object LastWriteTime | Select-Object -Last 4)
     $sig = (@($pf) + @($sf) | ForEach-Object { '{0}:{1}' -f $_.Name, $_.Length }) -join '|'
     if ($sig -eq $script:histSig) { return }   # 文件没变就不重读
     $script:histSig = $sig
@@ -213,7 +262,9 @@ function Load-History {
     foreach ($k in $h.Keys) { $r = Analyze $h[$k]; if ($r) { $a[$k] = $r } }
     $script:hist = $h
     $script:analysis = $a
-    $script:sys = @(foreach ($f in $sf) { Import-Csv $f.FullName })
+    # sys-*.csv（旧格式）和 sysv2-*.csv（多了磁盘列）合并，按时间排序
+    $s = @(foreach ($f in $sf) { foreach ($r in (Import-Csv $f.FullName)) { $t = [datetime]::ParseExact($r.Time, 'yyyy-MM-dd HH:mm:ss', $null); if ($t -ge $cut) { $r | Add-Member -NotePropertyName T -NotePropertyValue $t -PassThru } } })
+    $script:sys = @($s | Sort-Object T)
 }
 
 function Load-Rules {
@@ -225,11 +276,14 @@ function Load-Rules {
     # PowerShell 5.1 把 JSON 数组当成一个整体返回，用 foreach 拆成单条规则
     foreach ($f in $files) { try { foreach ($r in (ConvertFrom-Json (Get-Content $f.FullName -Raw -Encoding UTF8))) { $all += $r } } catch {} }
     $script:rules = $all
+    $w = @{}; foreach ($r in $all) { if ($r.id -like 'watch-*' -and $r.when.process) { $w[$r.when.process] = $r } }
+    $script:watched = $w
 }
 
 function Update-Slow {
-    # 每分钟一次：规则、历史数据、服务进程号、计划任务状态、最近动作、规则里的文件大小
+    # 每分钟一次：规则、历史数据、服务进程号、计划任务状态、最近动作、规则里的文件大小、清理过期的实时数据
     Load-Rules
+    Load-Ignores
     Load-History
     $svcNames = @($script:rules | ForEach-Object { $_.when.process } | Where-Object { $_ -like 'svc:*' } | ForEach-Object { $_.Substring(4) } | Sort-Object -Unique)
     $map = @{}
@@ -248,7 +302,23 @@ function Update-Slow {
     $fm = @{}
     foreach ($r in $script:rules) { $f = $r.when.file; if ($f -and -not $fm.ContainsKey($f)) { $fm[$f] = if (Test-Path -LiteralPath $f) { [int]((Get-Item -LiteralPath $f).Length / 1MB) } else { $null } } }
     $script:fileMB = $fm
-    if ($btnInstall) { $btnInstall.Text = if ($script:taskState) { '卸载看门狗计划任务' } else { '安装看门狗（每 10 分钟自动检查）' } }
+    # 15 分钟没出现的程序，丢掉它的实时数据
+    $old = (Get-Date).AddMinutes(-15)
+    foreach ($k in @($script:series.Keys)) { if ($k -notlike 'sys:*' -and $script:series[$k].LastSeen -lt $old) { $script:series.Remove($k) } }
+    if ($btnInstall) { Set-Text $btnInstall $(if ($script:taskState) { '卸载看门狗' } else { '安装看门狗' }) }
+}
+
+function Record($name, $value, $now) {
+    $r = $script:series[$name]
+    if (-not $r) {
+        if ($script:series.Count -ge $MaxSeries) {   # 满了：丢掉最久没出现的那条
+            $oldest = $null
+            foreach ($k in $script:series.Keys) { if ($k -notlike 'sys:*' -and (-not $oldest -or $script:series[$k].LastSeen -lt $script:series[$oldest].LastSeen)) { $oldest = $k } }
+            if ($oldest) { $script:series.Remove($oldest) }
+        }
+        $r = New-Object Ring($RingSize); $script:series[$name] = $r
+    }
+    $r.Add($now, $value)
 }
 
 function Sample-Processes {
@@ -304,6 +374,7 @@ function Eval-Rules {
             if ($w.minFileMB) { if ($fmb -lt $w.minFileMB) { continue }; $why += ('{0} 已经 {1:N0} MB，超过上限 {2} MB' -f (Split-Path $w.file -Leaf), $fmb, $w.minFileMB) }
         }
         if (-not $why) { continue }
+        if (Is-Ignored "rule:$($r.id)") { continue }   # 用户选了忽略 / 确认正常
         $t = if ($r.target) { $r.target } else { $w.process }
         $h = [pscustomobject]@{ Rule = $r; Why = ($why -join '；'); Target = $t }
         $hits += $h
@@ -313,13 +384,70 @@ function Eval-Rules {
 }
 
 function Fmt-MB($mb) { if ($mb -ge 1024) { '{0:N1} GB' -f ($mb / 1024) } else { '{0:N0} MB' -f $mb } }
+# [int]：裸写的 -1 当参数传进来会变成字符串 "-1"，比较大小会出错
+function New-Rating($text, [int]$level, [int]$score, $note, $forecast, $trend) { [pscustomobject]@{ Text = $text; Level = $level; Score = $score; Note = $note; Forecast = $forecast; Trend = $trend } }
+
+# ---- 忽略 / 确认正常（ignore.json，个人设置，不进 git）----
+# key：rule:<规则 id> / prog:<程序名>（稳定性问题） / io:<程序名>（大量读写）
+# type：snooze = 忽略 24 小时（until 到期后恢复提醒）；normal = 确认正常，不再提醒
+function Ignore-Path { Join-Path $RulesDir 'ignore.json' }
+function Load-Ignores {
+    $p = Ignore-Path
+    $sig = if (Test-Path $p) { (Get-Item $p).LastWriteTimeUtc.Ticks } else { 0 }
+    if ($sig -eq $script:ignoreSig) { return }
+    $script:ignoreSig = $sig
+    $m = @{}
+    if (Test-Path $p) { try { foreach ($i in (ConvertFrom-Json (Get-Content $p -Raw -Encoding UTF8))) { $m[$i.key] = $i } } catch {} }
+    $script:ignores = $m
+}
+function Save-Ignores {
+    $now = Get-Date
+    $list = @($script:ignores.Values | Where-Object { $_.type -ne 'snooze' -or [datetime]$_.until -gt $now })
+    [IO.File]::WriteAllText((Ignore-Path), (ConvertTo-Json -InputObject $list -Depth 4), (New-Object Text.UTF8Encoding $false))
+    $script:ignoreSig = $null; Load-Ignores
+}
+function Is-Ignored($key) {
+    if (-not $key) { return $null }
+    $i = $script:ignores[$key]
+    if (-not $i) { return $null }
+    if ($i.type -eq 'snooze' -and [datetime]$i.until -lt (Get-Date)) { return $null }
+    $i
+}
+function Ignore-Issue($key, $label, [switch]$Normal) {
+    if (-not $key) { return }
+    $script:ignores[$key] = [pscustomobject][ordered]@{
+        key = $key; label = $label
+        type = $(if ($Normal) { 'normal' } else { 'snooze' })
+        until = $(if ($Normal) { '' } else { (Get-Date).AddHours(24).ToString('yyyy-MM-ddTHH:mm:ss') })
+    }
+    Save-Ignores; Refresh-All
+}
+function Unignore-Name($name) {
+    foreach ($k in @($script:ignores.Keys)) {
+        if ($k -eq "prog:$name" -or $k -eq "io:$name") { $script:ignores.Remove($k) }
+        elseif ($k -like 'rule:*') { $r = $script:rules | Where-Object { "rule:$($_.id)" -eq $k } | Select-Object -First 1; if ($r -and ($r.target -eq $name -or $r.when.process -eq $name)) { $script:ignores.Remove($k) } }
+    }
+    Save-Ignores; Refresh-All
+}
+function Ignore-Note($i) { if ($i.type -eq 'normal') { '你已确认正常，不再提醒' } else { '已忽略，{0} 后恢复提醒' -f ([datetime]$i.until).ToString('MM-dd HH:mm') } }
+
+# 稳定性评级（加上用户的忽略设置）
+function Get-Rating($name, $mb) {
+    $rt = Get-RatingRaw $name $mb
+    if ($rt.Level -ge 1 -and $rt.Text -ne '已知问题') {
+        $ig = Is-Ignored "prog:$name"
+        if ($ig) { return (New-Rating $rt.Text -1 0 (Ignore-Note $ig) '' $rt.Trend) }
+    }
+    $rt
+}
 
 # 稳定性评级。Level：2 = 有问题（红）、1 = 需要留意（黄）、0 = 正常（蓝）、-1 = 中性（灰）。Score 用于"问题优先"排序。
-function Get-Rating($name, $mb) {
+# 优先用看门狗的长期记录（≥ 1 小时）；没有的话用窗口的实时数据（≥ 10 分钟）给初步判断。
+function Get-RatingRaw($name, $mb) {
     $hit = $script:hitByTarget[$name]
     if ($hit) {
         $lvl = if ($hit.Rule.fix.type -eq 'none') { 1 } else { 2 }
-        return [pscustomobject]@{ Text = '已知问题'; Level = $lvl; Score = (100 + 5 * $lvl); Note = $hit.Rule.title; Forecast = '' }
+        return (New-Rating '已知问题' $lvl (100 + 5 * $lvl) $hit.Rule.title '' '')
     }
     $a = $script:analysis[$name]
     # 现在的占用比最后一条记录低很多 = 刚被重启过，之前的趋势作废
@@ -327,23 +455,27 @@ function Get-Rating($name, $mb) {
         $lastMB = $script:hist[$name][$script:hist[$name].Count - 1].MB
         if ($mb -lt 0.6 * $lastMB) { $a = $null }
     }
-    if (-not $a) { return [pscustomobject]@{ Text = '数据不足'; Level = -1; Score = 0; Note = ''; Forecast = '' } }
-    $fc = if ($a.Slope -gt 0) { '照这个速度，24 小时后约 ' + (Fmt-MB ($mb + $a.Slope * 24)) } else { '' }
-    $note = '近 {0:N1} 小时涨了 {1:N0} MB（约 {2:N0} MB/小时）' -f $a.Span, $a.Growth, $a.Slope
-    if ($a.Slope -ge $LeakSlopeMBh -and $a.Growth -ge $LeakGrowthMB -and $a.R2 -ge $LeakR2) {
-        return [pscustomobject]@{ Text = '疑似泄漏'; Level = 2; Score = 90; Note = $note; Forecast = $fc }
+    if ($a) {
+        $trend = '{0:+#,0;-#,0;0} MB / {1:N1} 小时' -f $a.Growth, $a.Span
+        $fc = if ($a.Slope -gt 0) { '照这个速度，24 小时后约 ' + (Fmt-MB ($mb + $a.Slope * 24)) } else { '' }
+        $note = '近 {0:N1} 小时涨了 {1:N0} MB（约 {2:N0} MB/小时）' -f $a.Span, $a.Growth, $a.Slope
+        if ($a.Slope -ge $LeakSlopeMBh -and $a.Growth -ge $LeakGrowthMB -and $a.R2 -ge $LeakR2) { return (New-Rating '疑似泄漏' 2 90 $note $fc $trend) }
+        if ($a.Slope -ge $RiseSlopeMBh -and $a.Growth -ge $RiseGrowthMB -and $a.R2 -ge $RiseR2) { return (New-Rating '缓慢上涨' 1 60 $note $fc $trend) }
+        if ($a.Cv -ge $WobbleCv) { return (New-Rating '波动大' -1 10 '忽高忽低，通常是正常使用（比如开关网页）' '' $trend) }
+        return (New-Rating '稳定' 0 0 ('近 {0:N1} 小时平稳' -f $a.Span) '' $trend)
     }
-    if ($a.Slope -ge $RiseSlopeMBh -and $a.Growth -ge $RiseGrowthMB -and $a.R2 -ge $RiseR2) {
-        return [pscustomobject]@{ Text = '缓慢上涨'; Level = 1; Score = 60; Note = $note; Forecast = $fc }
+    $ring = $script:series[$name]
+    $st = if ($ring) { $ring.Stats(120) } else { $null }
+    if ($st -and $st[3] -ge $ShortMinHours) {
+        $mins = $st[3] * 60
+        $trend = '{0:+#,0;-#,0;0} MB / {1:N0} 分钟' -f $st[2], $mins
+        if ($st[0] -ge $ShortSlopeMBh -and $st[2] -ge $ShortGrowthMB -and $st[1] -ge $ShortR2) {
+            return (New-Rating '短时上涨' 1 50 ('近 {0:N0} 分钟持续上涨 {1:N0} MB，继续观察（满 1 小时才判断是否泄漏）' -f $mins, $st[2]) ('照这个速度，1 小时后约 ' + (Fmt-MB ($mb + $st[0]))) $trend)
+        }
+        if ($st[4] -ge $WobbleCv) { return (New-Rating '波动大' -1 10 '忽高忽低，通常是正常使用' '' $trend) }
+        return (New-Rating '稳定' 0 0 ('近 {0:N0} 分钟平稳（初步，满 1 小时更准）' -f $mins) '' $trend)
     }
-    if ($a.Cv -ge $WobbleCv) { return [pscustomobject]@{ Text = '波动大'; Level = -1; Score = 10; Note = '忽高忽低，通常是正常使用（比如开关网页）'; Forecast = '' } }
-    [pscustomobject]@{ Text = '稳定'; Level = 0; Score = 0; Note = ''; Forecast = '' }
-}
-
-function Trend-Text($name) {
-    $a = $script:analysis[$name]
-    if (-not $a) { return '—' }
-    '{0:+#,0;-#,0;0} MB / {1:N1} 小时' -f $a.Growth, $a.Span
+    New-Rating '数据不足' -1 0 '窗口打开满 10 分钟后开始判断' '' '—'
 }
 
 function Ago($t) {
@@ -371,6 +503,9 @@ function Get-Icon($name) {
     $script:icons[$name] = $bmp
     $bmp
 }
+
+# 只在文字真的变了时才改，避免控件无谓重绘（闪烁）
+function Set-Text($ctl, $text) { if ($ctl.Text -ne $text) { $ctl.Text = $text } }
 
 # ---------- 主题：颜色、字体、画笔（只创建一次） ----------
 function RGB($r, $g, $b) { [Drawing.Color]::FromArgb($r, $g, $b) }
@@ -403,7 +538,7 @@ function Brush($name, $color) { $GDI[$name] = New-Object Drawing.SolidBrush($col
 function Pen($name, $color, $w) { $GDI[$name] = New-Object Drawing.Pen($color, $w) }
 Brush 'bg' $cBg; Brush 'panel' $cPanel; Brush 'rowA' $cRowA; Brush 'rowB' $cRowB; Brush 'dim' $cDim
 Brush 'sel' (RGB 12 46 54); Brush 'row2' (RGB 78 14 22); Brush 'row1' (RGB 48 40 8)
-Brush 'acc' $cAccent; Pen 'accPen' $cAccent 1; Pen 'accDim' $cRedDim 1
+Brush 'dimLine' $cRedDim; Brush 'acc' $cAccent; Pen 'accPen' $cAccent 1; Pen 'accDim' $cRedDim 1; Pen 'cyanPen' $cCyan 2
 Pen 'scan' ([Drawing.Color]::FromArgb(12, 255, 90, 80)) 1
 Pen 'grid' ([Drawing.Color]::FromArgb(150, 92, 30, 33)) 1
 foreach ($l in 0, 1, 2, -1) {
@@ -435,15 +570,15 @@ function CutPoly($x, $y, $w, $h, $c) {
     )
 }
 function Scanlines($g, $w, $h) { for ($y = 2; $y -lt $h; $y += 3) { $g.DrawLine($GDI['scan'], 0, $y, $w, $y) } }
-# 面板外框：底色 + 扫描线 + 珊瑚红切角框 + 标题
-function Frame($g, $w, $h, $tag, $title) {
+# 面板外框：底色 + 扫描线 + 切角框 + 标题。$active = 荧光蓝边框（表示下方走势图正在显示它）
+function Frame($g, $w, $h, $tag, $title, [switch]$Active) {
     $g.SmoothingMode = 'AntiAlias'
     $g.FillRectangle($GDI['bg'], 0, 0, $w, $h)
-    $poly = CutPoly 0.5 0.5 ($w - 1.5) ($h - 1.5) 16
+    $poly = CutPoly 1 1 ($w - 2.5) ($h - 2.5) 16
     $g.FillPolygon($GDI['panel'], $poly)
     Scanlines $g $w $h
-    $g.DrawPolygon($GDI['accPen'], $poly)
-    $g.FillRectangle($GDI['acc'], 0, 0, 46, 4)
+    $g.DrawPolygon($(if ($Active) { $GDI['cyanPen'] } else { $GDI['accPen'] }), $poly)
+    $g.FillRectangle($(if ($Active) { $GDI['lv0'] } else { $GDI['acc'] }), 0, 0, 46, 4)
     if ($tag) {
         Txt $g ('// ' + $tag) $fTagB $cAccent 12 8 160 22
         Txt $g $title $fCNb $cGray (18 + (TxtW $g ('// ' + $tag) $fTagB)) 8 160 22
@@ -460,6 +595,27 @@ $form.Font = $fCN
 $form.BackColor = $cBg
 $form.ForeColor = $cText
 
+# 窗口 / 任务栏图标：有 WatchDog.ico（Build-Exe.ps1 生成）就用它，否则启动时画一个同样的
+$script:iconHandle = [IntPtr]::Zero
+$script:formIcon = $null
+$icoPath = Join-Path $ToolDir 'WatchDog.ico'
+if (Test-Path $icoPath) { try { $script:formIcon = New-Object Drawing.Icon($icoPath); $null = $script:formIcon.Handle } catch { $script:formIcon = $null } }
+if (-not $script:formIcon) {
+    $ib = New-Object Drawing.Bitmap(32, 32); $ig = [Drawing.Graphics]::FromImage($ib)
+    try {
+        $ig.SmoothingMode = 'AntiAlias'; $ig.TextRenderingHint = 'AntiAliasGridFit'
+        $pts = CutPoly 1 1 29.5 29.5 7
+        $ig.FillPolygon($GDI['panel'], $pts); $ig.DrawPolygon($GDI['accPen'], $pts)
+        $iconFont = New-Object Drawing.Font('Bahnschrift SemiBold', 17, [Drawing.FontStyle]::Bold, [Drawing.GraphicsUnit]::Pixel)
+        $sf = New-Object Drawing.StringFormat; $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
+        try { $ig.DrawString('W', $iconFont, $GDI['lv0'], (New-Object Drawing.RectangleF(0, 1, 32, 32)), $sf) } finally { $iconFont.Dispose(); $sf.Dispose() }
+        $ig.FillRectangle($GDI['lv2'], 4, 4, 4, 4)
+        $script:iconHandle = $ib.GetHicon()
+        $script:formIcon = [Drawing.Icon]::FromHandle($script:iconHandle)
+    } finally { $ig.Dispose(); $ib.Dispose() }
+}
+$form.Icon = $script:formIcon
+
 # 顶部标题条
 $header = New-Object BufferedPanel
 $header.Dock = 'Top'; $header.Height = 50
@@ -468,28 +624,40 @@ $header.Add_Paint({
     $g = $e.Graphics; $w = $s.Width; $h = $s.Height
     $g.FillRectangle($GDI['bg'], 0, 0, $w, $h)
     Txt $g 'WATCHDOG' $fHead $cCyan 16 6 200 34
-    Txt $g '// 不只看谁占得多，而是看谁在变坏、为什么、怎么修' $fCN $cAccent 152 6 520 34
+    Txt $g '// Which dream is your want' $fTagB $cAccent 152 6 260 34
+    # 自身占用：看门狗（最近一次后台检查）+ 本窗口
+    $last = if ($script:sys.Count -gt 0) { $script:sys[$script:sys.Count - 1] } else { $null }
+    $dogTxt = if ($last -and $last.SelfPeakMB) { '看门狗 每 10 分钟运行 {0:N1} 秒 · CPU {1:N1} 秒 · 峰值 {2} MB，用完即退出' -f ([double]$last.RunMs / 1000), [double]$last.SelfCpuSec, $last.SelfPeakMB }
+              elseif ($last) { '看门狗 每 10 分钟运行 {0:N1} 秒，用完即退出' -f ([double]$last.RunMs / 1000) }
+              else { '看门狗 未运行' }
+    $selfTxt = '本窗口 {0:N0} MB · CPU {1:N1}%' -f $script:selfMB, $script:selfCpu
+    $rx = $w - 262; $rw = [math]::Max(200, $rx - 420)
+    Txt $g $dogTxt $fCN $cGray ($rx - $rw) 6 $rw 18 $tfR
+    Txt $g $selfTxt $fCN $cCyan ($rx - $rw) 24 $rw 18 $tfR
+    $g.FillRectangle($GDI['dimLine'], $rx + 4, 12, 1, 26)
     $live = if ($script:tick % 2 -eq 0) { $GDI['lv2'] } else { $GDI['panel'] }
     $g.FillRectangle($live, $w - 250, 17, 8, 8)
     Txt $g ('LIVE  ' + (Get-Date).ToString('HH:mm')) $fTagB $cCyan ($w - 234) 6 90 28
-    Txt $g 'SYS.MON v5 // 0x5744' $fSmall $cRedDim ($w - 200) 6 186 28 $tfR
+    Txt $g 'SYS.MON v6 // 0x5744' $fSmall $cRedDim ($w - 200) 6 186 28 $tfR
     $g.FillRectangle($GDI['acc'], 0, $h - 3, $w, 1)
     $g.FillPolygon($GDI['acc'], [Drawing.PointF[]]@((New-Object Drawing.PointF(0, ($h - 6))), (New-Object Drawing.PointF(220, ($h - 6))), (New-Object Drawing.PointF(226, ($h - 2))), (New-Object Drawing.PointF(0, ($h - 2)))))
 })
 
-# 四张卡片
+# 四张卡片（点击切换下方走势图）
 $cards = New-Object BufferedPanel
 $cards.Dock = 'Top'; $cards.Height = 146; $cards.BackColor = $cBg
 
-function New-Card($tag, $title, $code) {
+function New-Card($tag, $title, $code, $mode) {
     $p = New-Object BufferedPanel
-    $p.Tag = @{ Code = $code; Tag = $tag; Title = $title; Value = '--'; Badge = '...'; Level = -1; Sub = ''; Pct = -1 }
+    $p.Cursor = 'Hand'
+    $p.Tag = @{ Code = $code; Tag = $tag; Title = $title; Mode = $mode; Value = '--'; Badge = '...'; Level = -1; Sub = ''; Pct = -1 }
     $p.Add_Paint({
         param($s, $e)
         $g = $e.Graphics; $w = $s.Width; $h = $s.Height; $d = $s.Tag
-        Frame $g $w $h $d.Tag $d.Title
+        $active = $script:chartMode -eq $d.Mode
+        Frame $g $w $h $d.Tag $d.Title -Active:$active
         $lvl = [int]$d.Level
-        Txt $g $d.Code $fSmall $cRedDim ($w - 160) ($h - 17) 148 14 $tfR
+        Txt $g $(if ($active) { '▼ 走势显示中' } else { $d.Code }) $fSmall $(if ($active) { $cCyan } else { $cRedDim }) ($w - 160) ($h - 17) 148 14 $tfR
         if ($d.Badge) {
             $bx = $w - 118; $by = 10
             $g.FillPolygon($GDI["lv$lvl"], [Drawing.PointF[]]@((New-Object Drawing.PointF(($bx + 8), $by)), (New-Object Drawing.PointF(($bx + 104), $by)), (New-Object Drawing.PointF(($bx + 96), ($by + 22))), (New-Object Drawing.PointF($bx, ($by + 22)))))
@@ -507,21 +675,30 @@ function New-Card($tag, $title, $code) {
         }
         Txt $g $d.Sub $fCN $cGray 12 90 ($w - 24) 20
     })
+    $p.Add_Click({ param($s, $e); Set-ChartMode $s.Tag.Mode })
     $cards.Controls.Add($p)
     $p
 }
-$cardMem  = New-Card 'MEMORY' '内存' 'MEM-01 // 0x4D45'
-$cardCpu  = New-Card 'CPU' '处理器' 'CPU-02 // 0x4350'
-$cardDisk = New-Card 'DISK' '磁盘读写' 'DSK-03 // 0x4453'
-$cardDog  = New-Card 'WATCHDOG' '看门狗' 'WDG-04 // 0x5744'
+$cardMem  = New-Card 'MEMORY' '内存' 'MEM-01 // 0x4D45' 'mem'
+$cardCpu  = New-Card 'CPU' '处理器' 'CPU-02 // 0x4350' 'cpu'
+$cardDisk = New-Card 'DISK' '磁盘读写' 'DSK-03 // 0x4453' 'disk'
+$cardDog  = New-Card 'WATCHDOG' '看门狗 · 自身占用' 'WDG-04 // 0x5744' 'dog'
+$CardList = @($cardMem, $cardCpu, $cardDisk, $cardDog)   # 注意：PowerShell 变量名不分大小写，不能叫 $Cards
 $cards.Add_Resize({
     $w = [int](($cards.ClientSize.Width - 60) / 4)
     $i = 0
-    foreach ($c in @($cardMem, $cardCpu, $cardDisk, $cardDog)) { $c.SetBounds(12 + $i * ($w + 12), 6, $w, 134); $i++ }
+    foreach ($c in $CardList) { $c.SetBounds(12 + $i * ($w + 12), 6, $w, 134); $i++ }
 })
-function Set-Card($card, $value, $badge, $level, $sub, $pct) {
-    $d = $card.Tag; $d.Value = $value; $d.Badge = $badge; $d.Level = $level; $d.Sub = $sub; $d.Pct = $pct
+function Set-Card($card, $value, $badge, [int]$level, $sub, [double]$pct) {
+    $d = $card.Tag
+    if ($d.Value -eq $value -and $d.Badge -eq $badge -and $d.Level -eq $level -and $d.Sub -eq $sub -and [int]$d.Pct -eq [int]$pct) { return }
+    $d.Value = $value; $d.Badge = $badge; $d.Level = $level; $d.Sub = $sub; $d.Pct = $pct
     $card.Invalidate()
+}
+function Set-ChartMode($mode) {
+    $script:chartMode = $mode; $script:chartRange = 'auto'
+    foreach ($c in $CardList) { $c.Invalidate() }
+    $chart.Invalidate()
 }
 
 # ---------- 右侧栏：体检结论 / 选中程序 / 操作 ----------
@@ -542,15 +719,31 @@ $diag.Add_Paint({
         if ($y + 36 -gt $h - 6) { Txt $g ('…还有更多，见左侧列表（按"稳定性"排在最前）') $fCN $cGray 30 $y ($w - 44) 18; break }
         $c = $LevelColor[[int]$is.Level]
         Txt $g '▲' $fCN $c 14 $y 14 18
-        Txt $g $is.Title $fCNb $c 30 $y ($w - 44) 18
+        $tw = $w - 44
+        if ($is.Key) {
+            # 右侧两个小按钮：忽略 24 小时 / 确认正常
+            $bx1 = $w - 112; $bx2 = $w - 62
+            $g.DrawRectangle($GDI['accPen'], $bx1, $y + 1, 44, 16); Txt $g '忽略' $fCN $cAccent $bx1 ($y + 1) 44 16 $tfC
+            $g.DrawRectangle($GDI['accPen'], $bx2, $y + 1, 44, 16); Txt $g '正常' $fCN $cAccent $bx2 ($y + 1) 44 16 $tfC
+            $tw = $w - 150
+        }
+        Txt $g $is.Title $fCNb $c 30 $y $tw 18
         Txt $g $is.Sub $fCN $cGray 30 ($y + 17) ($w - 44) 17
-        $rects += , @($y, ($y + 36), $is.Target)
+        $rects += , @($y, ($y + 36), $is.Target, $is.Key, $is.Title, ($w - 112), ($w - 62))
         $y += 38
     }
     $script:issueRects = $rects
 })
 $diag.Add_MouseClick({
     param($s, $e)
+    foreach ($r in $script:issueRects) {
+        if ($e.Y -lt $r[0] -or $e.Y -ge $r[1] -or -not $r[3] -or $e.Y -gt $r[0] + 18) { continue }
+        if ($e.X -ge $r[5] -and $e.X -lt $r[5] + 44) { Ignore-Issue $r[3] $r[4]; return }
+        if ($e.X -ge $r[6] -and $e.X -lt $r[6] + 44) {
+            if (Ask ("确认「{0}」是正常的？`n`n以后不再提醒这个问题；如果是规则发现的，看门狗也不会再自动处理它。可以随时在右键菜单或""已忽略的问题""里恢复。" -f $r[4])) { Ignore-Issue $r[3] $r[4] -Normal }
+            return
+        }
+    }
     foreach ($r in $script:issueRects) { if ($e.Y -ge $r[0] -and $e.Y -lt $r[1] -and $r[2]) { Select-Target $r[2]; break } }
 })
 
@@ -562,12 +755,14 @@ $detail.Add_Paint({
     Frame $g $w $h 'TARGET' '选中的程序'
     $name = $script:selected
     $r = if ($name) { $script:rows[$name] } else { $null }
-    if (-not $r) { Txt $g '在左边列表里点选一个程序（或点上面的问题），这里显示它的稳定性、原因和修复方法。' $fCN $cGray 14 40 ($w - 28) 60 $tfW; return }
+    if (-not $r) { Txt $g '在左边列表里点选一个程序（或点上面的问题），这里显示它的稳定性、原因和修复方法。右键程序可以让看门狗专门监控它。' $fCN $cGray 14 40 ($w - 28) 60 $tfW; return }
     $icon = Get-Icon $name
     if ($icon) { $g.InterpolationMode = 'HighQualityBicubic'; $g.DrawImage($icon, 14, 38, 32, 32) }
     else { $g.FillRectangle($GDI['dim'], 14, 38, 32, 32); $g.DrawRectangle($GDI['accPen'], 14, 38, 32, 32) }
     Txt $g $name $fCNbig $cCyan 56 36 ($w - 70) 22
-    Txt $g $(if ($Desc[$name]) { $Desc[$name] } else { '-' }) $fCN $cGray 56 58 ($w - 70) 18
+    $sub = if ($Desc[$name]) { $Desc[$name] } else { '-' }
+    if ($script:watched.ContainsKey($name)) { $wr = $script:watched[$name]; $sub += ('  ·  ◉ 看门狗监控中（超过 {0} MB {1}）' -f $wr.when.minMB, $(if ($wr.auto) { '自动重启' } else { '提醒' })) }
+    Txt $g $sub $fCN $cGray 56 58 ($w - 70) 18
     $cols = @(@('内存', ('{0:N0} MB' -f $r.PrivMB)), @('CPU', ('{0:N1} %' -f $r.CpuPct)), @('读写', ('{0:N1} MB/s' -f $r.IoMBs)), @('进程', [string]$r.Count))
     $cw = ($w - 28) / 4
     for ($i = 0; $i -lt 4; $i++) {
@@ -576,15 +771,13 @@ $detail.Add_Paint({
     }
     $rt = Get-Rating $name $r.PrivMB
     Txt $g ('稳定性：' + $rt.Text) $fCNb $LevelColor[[int]$rt.Level] 14 122 130 18
-    Txt $g $(if ($rt.Text -eq '已知问题') { Trend-Text $name } else { $rt.Note }) $fCN $cGray 140 122 ($w - 154) 18
+    Txt $g $(if ($rt.Text -eq '已知问题') { $rt.Trend } else { $rt.Note }) $fCN $cGray 140 122 ($w - 154) 18
     $hit = $script:hitByTarget[$name]
     if ($hit) {
         Txt $g ('已知问题：' + $hit.Rule.title) $fCNb $LevelColor[[int]$rt.Level] 14 144 ($w - 28) 18
         Txt $g ($hit.Why + '。' + $hit.Rule.cause) $fCN $cGray 14 164 ($w - 28) 30 $tfW
     } elseif ($rt.Forecast) {
         Txt $g $rt.Forecast $fCNb $LevelColor[[int]$rt.Level] 14 144 ($w - 28) 18
-    } elseif ($rt.Text -eq '数据不足') {
-        Txt $g '看门狗记录满 2 小时后才能判断稳定性。' $fCN $cGray 14 144 ($w - 28) 18
     }
 })
 
@@ -613,7 +806,7 @@ $side.Controls.Add($detail)
 $side.Controls.Add((New-Object Windows.Forms.Panel -Property @{ Dock = 'Top'; Height = 10; BackColor = $cBg }))
 $side.Controls.Add($diag)
 
-# ---------- 主区域：程序列表 + 曲线 ----------
+# ---------- 主区域：程序列表 + 走势图 ----------
 $main = New-Object Windows.Forms.Panel
 $main.Dock = 'Fill'; $main.BackColor = $cBg; $main.Padding = New-Object Windows.Forms.Padding(12, 0, 12, 0)
 
@@ -621,7 +814,7 @@ $lv = New-Object BufferedListView
 $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.HideSelection = $false; $lv.MultiSelect = $false
 $lv.OwnerDraw = $true; $lv.BackColor = $cRowA; $lv.ForeColor = $cText; $lv.BorderStyle = 'None'
 $rowH = New-Object Windows.Forms.ImageList; $rowH.ImageSize = New-Object Drawing.Size(1, 28); $lv.SmallImageList = $rowH
-foreach ($c in @(@('程序', 175), @('说明', 140), @('内存 MB', 80), @('CPU %', 58), @('读写 MB/s', 78), @('稳定性', 78), @('24 小时变化', 135), @('判断 / 预测', 180))) {
+foreach ($c in @(@('程序', 175), @('说明', 140), @('内存 MB', 80), @('CPU %', 58), @('读写 MB/s', 78), @('稳定性', 78), @('变化', 135), @('判断 / 预测', 180))) {
     [void]$lv.Columns.Add($c[0], $c[1])
 }
 $RightCols = @(2, 3, 4)
@@ -654,7 +847,9 @@ $lv.Add_DrawSubItem({
         $g.InterpolationMode = 'HighQualityBicubic'
         if ($icon) { $g.DrawImage($icon, $r.X + 8, $r.Y + 5, 18, 18) } else { $g.FillRectangle($GDI['dim'], $r.X + 11, $r.Y + 8, 12, 12) }
         if ($it.Selected) { $g.FillRectangle($GDI['lv0'], $r.X, $r.Y + 3, 3, $r.Height - 6) }
-        Txt $g $it.Text $fCNb $cText ($r.X + 34) $r.Y ($r.Width - 40) $r.Height
+        $tw = $r.Width - 40
+        if ($script:watched.ContainsKey($it.Text)) { Txt $g '◉' $fCN $cCyan ($r.Right - 20) $r.Y 16 $r.Height; $tw -= 18 }
+        Txt $g $it.Text $fCNb $cText ($r.X + 34) $r.Y $tw $r.Height
         return
     }
     $io = 0.0; [void][double]::TryParse($it.SubItems[4].Text, [ref]$io)
@@ -679,70 +874,159 @@ function Fit-Columns {
 $lv.Add_Resize({ Fit-Columns })
 $lv.Add_SelectedIndexChanged({
     if ($script:updating) { return }
-    if ($lv.SelectedItems.Count -gt 0) { $script:selected = $lv.SelectedItems[0].Text; Update-DetailButtons; $chart.Invalidate(); $detail.Invalidate() }
+    if ($lv.SelectedItems.Count -gt 0) { $script:selected = $lv.SelectedItems[0].Text; Update-DetailButtons; Set-ChartMode 'proc'; $detail.Invalidate() }
 })
 
+# ---------- 走势图：内存 / CPU / 磁盘 / 看门狗 / 选中的程序，1 小时（实时）或 24 小时（看门狗记录） ----------
 $chart = New-Object BufferedPanel
-$chart.Dock = 'Bottom'; $chart.Height = 200
+$chart.Dock = 'Top'; $chart.Height = 210   # 走势图在列表上方
+
+# 一条线：@{ T = long[] ticks; V = double[] 值; Level = 颜色; Name = 图例 }
+function Ring-Line($key, $level, $label, $scale = 1.0) {
+    $r = $script:series[$key]
+    if (-not $r -or $r.Count -lt 2) { return $null }
+    $n = $r.Count; $t = New-Object 'long[]' $n; $v = New-Object 'double[]' $n
+    for ($i = 0; $i -lt $n; $i++) { $t[$i] = $r.TimeAt($i); $v[$i] = $r.ValueAt($i) * $scale }
+    @{ T = $t; V = $v; Level = $level; Name = $label }
+}
+function Hist-Line($items, $getter, $level, $label) {
+    $items = @(foreach ($x in $items) { $x }); $n = $items.Count   # 不用 @(List)，PowerShell 5.1 有时会报"参数类型不匹配"
+    if ($n -lt 2) { return $null }
+    $t = New-Object 'long[]' $n; $v = New-Object 'double[]' $n
+    for ($i = 0; $i -lt $n; $i++) { $t[$i] = $items[$i].T.ToUniversalTime().Ticks; $v[$i] = [double](& $getter $items[$i]) }
+    @{ T = $t; V = $v; Level = $level; Name = $label }
+}
+# 按当前模式取数据：返回 @{ Title; Unit; Lines; Note; FixedMax }
+function Get-ChartData($range) {
+    $m = $script:chartMode
+    switch ($m) {
+        'mem' {
+            if ($range -eq '24h') { return @{ Title = '整机内存占用'; Unit = 'GB'; Lines = @(Hist-Line $script:sys { param($x) [double]$x.UsedMB / 1024 } 0 '已用'); Note = '看门狗每 10 分钟记录一次' } }
+            return @{ Title = '整机内存占用'; Unit = 'GB'; Lines = @(Ring-Line 'sys:mem' 0 '已用'); Note = '窗口打开期间每 5 秒一个点' }
+        }
+        'cpu' {
+            if ($range -eq '24h') { return @{ Title = 'CPU 占用'; Unit = '%'; FixedMax = 100; Lines = @(Hist-Line $script:sys { param($x) [double]$x.CpuPct } 0 'CPU'); Note = '看门狗检查时的瞬间值' } }
+            return @{ Title = 'CPU 占用'; Unit = '%'; FixedMax = 100; Lines = @(Ring-Line 'sys:cpu' 0 'CPU'); Note = '窗口打开期间每 5 秒一个点' }
+        }
+        'disk' {
+            if ($range -eq '24h') {
+                $v2 = @($script:sys | Where-Object { $null -ne $_.DiskWriteMBs })
+                return @{ Title = '磁盘读写'; Unit = 'MB/s'; Lines = @((Hist-Line $v2 { param($x) [double]$x.DiskReadMBs } 0 '读'), (Hist-Line $v2 { param($x) [double]$x.DiskWriteMBs } 1 '写')); Note = '看门狗检查时的瞬间值' }
+            }
+            return @{ Title = '磁盘读写'; Unit = 'MB/s'; Lines = @((Ring-Line 'sys:dr' 0 '读'), (Ring-Line 'sys:dw' 1 '写')); Note = '窗口打开期间每 5 秒一个点' }
+        }
+        'dog' {
+            $what = '看门狗做什么：每 10 分钟在后台运行约 5 秒 → ① 按规则检查，超过上限的自动修复  ② 记录各程序内存，用来判断稳定性 → 然后退出，不常驻内存'
+            if ($range -eq '24h') { return @{ Title = '看门狗每次检查耗时'; Unit = '秒'; Lines = @(Hist-Line $script:sys { param($x) [double]$x.RunMs / 1000 } 0 '耗时'); Note = $what } }
+            return @{ Title = '本监控窗口自身内存'; Unit = 'MB'; Lines = @(Ring-Line 'sys:self' 0 '本窗口'); Note = $what }
+        }
+        default {
+            $name = $script:selected
+            if (-not $name) { return @{ Title = ''; Lines = @(); Note = '点选列表里的程序看它的内存走势；点上面的卡片看整机内存 / CPU / 磁盘 / 看门狗' } }
+            $label = '{0}  ·  {1}' -f $name, $(if ($Desc[$name]) { $Desc[$name] } else { '-' })
+            if ($range -eq '24h') { return @{ Title = $label; Unit = 'MB'; Lines = @(Hist-Line $script:hist[$name] { param($x) $x.MB } 0 '内存'); Note = '看门狗每 10 分钟记录一次' } }
+            return @{ Title = $label; Unit = 'MB'; Lines = @(Ring-Line $name 0 '内存'); Note = '窗口打开期间每 5 秒一个点' }
+        }
+    }
+}
 $chart.Add_Paint({
     param($s, $e)
     $g = $e.Graphics; $w = $s.Width; $h = $s.Height
     $g.FillRectangle($GDI['bg'], 0, 0, $w, $h)
     $g.SmoothingMode = 'AntiAlias'
-    $poly = CutPoly 0.5 10.5 ($w - 1.5) ($h - 12) 16
+    $poly = CutPoly 0.5 0.5 ($w - 1.5) ($h - 2) 16
     $g.FillPolygon($GDI['panel'], $poly)
     Scanlines $g $w $h
     $g.DrawPolygon($GDI['accPen'], $poly)
-    $g.FillRectangle($GDI['acc'], 0, 10, 46, 4)
-    $name = $script:selected
-    Txt $g '// MEM TRACE 24H' $fTagB $cAccent 12 18 160 20
-    if (-not $name -or -not $script:hist.ContainsKey($name) -or $script:hist[$name].Count -lt 2) {
-        $msg = if ($name) { "$name ：还没有足够的历史数据（看门狗每 10 分钟记录一次）" } else { '点选上方任意一个程序，这里显示它最近 24 小时的内存曲线（数据来自看门狗，每 10 分钟一个点）' }
-        Txt $g $msg $fCN $cGray 14 46 ($w - 28) 24
+    $g.FillRectangle($GDI['acc'], 0, 0, 46, 4)
+    # 时间范围：auto = 选中程序有 24 小时记录就用 24 小时，否则 1 小时
+    $range = $script:chartRange
+    if ($range -eq 'auto') { $range = if ($script:chartMode -eq 'proc' -and $script:selected -and $script:hist.ContainsKey($script:selected) -and $script:hist[$script:selected].Count -ge 2) { '24h' } else { '1h' } }
+    $data = Get-ChartData $range
+    Txt $g '// TREND' $fTagB $cAccent 12 8 70 20
+    Txt $g $data.Title $fCNb $cText 84 8 ($w - 330) 20
+    # 右上角范围切换
+    $rects = @(); $x = $w - 190
+    foreach ($opt in @(@('1h', '近 1 小时'), @('24h', '近 24 小时'))) {
+        $on = $range -eq $opt[0]
+        $rw = 84
+        if ($on) { $g.FillRectangle($GDI['lv0'], $x, 7, $rw, 20); Txt $g $opt[1] $fCNb $cBg $x 7 $rw 20 $tfC }
+        else { $g.DrawRectangle($GDI['accPen'], $x, 7, $rw, 20); Txt $g $opt[1] $fCN $cAccent $x 7 $rw 20 $tfC }
+        $rects += , @($x, ($x + $rw), $opt[0]); $x += $rw + 6
+    }
+    $script:rangeRects = $rects
+    $lines = @($data.Lines | Where-Object { $_ })
+    $L = 70; $R = 24; $T = 36; $B = 42
+    $pw = $w - $L - $R; $ph = $h - $T - $B
+    Txt $g $data.Note $fCN $cGray 14 ($h - 22) ($w - 28) 16
+    if (-not $lines) {
+        $msg = if ($script:chartMode -eq 'proc' -and -not $script:selected) { $data.Note } elseif ($range -eq '1h') { '实时数据还不够：窗口每 5 秒记录一个点，稍等片刻；或者切到"近 24 小时"看看门狗的记录。' } else { '还没有 24 小时记录：看门狗每 10 分钟记录一次。可以先看"近 1 小时"的实时数据。' }
+        Txt $g $msg $fCN $cGray 14 44 ($w - 28) 40 $tfW
         return
     }
-    $pts = $script:hist[$name]
-    $cur = if ($script:rows[$name]) { $script:rows[$name].PrivMB } else { $pts[$pts.Count - 1].MB }
-    $rt = Get-Rating $name $cur
-    $lvl = if ($rt.Level -lt 0) { 0 } else { [int]$rt.Level }
-    $title = '{0}  ·  {1}  ·  {2}' -f $name, $(if ($Desc[$name]) { $Desc[$name] } else { '-' }), $rt.Text
-    Txt $g $title $fCNb $cText 150 18 ($w - 190) 20
-    $L = 70; $R = 24; $T = 46; $B = 28
-    $pw = $w - $L - $R; $ph = $h - $T - $B
-    $end = Get-Date; $begin = $end.AddHours(-24)
+    $end = [DateTime]::UtcNow.Ticks
+    $spanT = if ($range -eq '24h') { [TimeSpan]::FromHours(24).Ticks } else { [TimeSpan]::FromHours(1).Ticks }
+    $begin = $end - $spanT
     $max = 0.0; $min = [double]::MaxValue
-    foreach ($p in $pts) { if ($p.MB -gt $max) { $max = $p.MB }; if ($p.MB -lt $min) { $min = $p.MB } }
-    $lo = [math]::Max(0, $min - ($max - $min) * 0.15 - 10); $hi = $max + ($max - $min) * 0.15 + 10
+    foreach ($ln in $lines) { for ($i = 0; $i -lt $ln.V.Length; $i++) { if ($ln.T[$i] -lt $begin) { continue }; $v = $ln.V[$i]; if ($v -gt $max) { $max = $v }; if ($v -lt $min) { $min = $v } } }
+    if ($min -eq [double]::MaxValue) { $min = 0 }
+    if ($data.FixedMax) { $lo = 0; $hi = $data.FixedMax }
+    else { $pad = [math]::Max(($max - $min) * 0.15, [math]::Max($max * 0.02, 0.5)); $lo = [math]::Max(0, $min - $pad); $hi = $max + $pad }
+    $fmt = if ($hi -lt 10) { '{0:N1}' } else { '{0:N0}' }
     for ($i = 0; $i -le 3; $i++) {
         $y = $T + $ph * $i / 3
         $g.DrawLine($GDI['grid'], $L, $y, $L + $pw, $y)
-        Txt $g ('{0:N0}' -f ($hi - ($hi - $lo) * $i / 3)) $fSmall $cGray 6 ($y - 9) ($L - 14) 18 $tfR
+        Txt $g (($fmt -f ($hi - ($hi - $lo) * $i / 3)) + ' ' + $data.Unit) $fSmall $cGray 4 ($y - 9) ($L - 10) 18 $tfR
     }
-    for ($hr = 0; $hr -le 24; $hr += 6) {
-        $x = $L + $pw * $hr / 24
+    $ticks = if ($range -eq '24h') { 4 } else { 4 }
+    for ($k = 0; $k -le $ticks; $k++) {
+        $x = $L + $pw * $k / $ticks
         $g.DrawLine($GDI['grid'], $x, $T, $x, $T + $ph)
-        Txt $g $begin.AddHours($hr).ToString('HH:mm') $fSmall $cGray ($x - 20) ($T + $ph + 4) 40 18 $tfC
+        $lt = ([datetime]($begin + $spanT * $k / $ticks)).ToLocalTime()
+        Txt $g $lt.ToString('HH:mm') $fSmall $cGray ($x - 20) ($T + $ph + 4) 40 16 $tfC
     }
-    $arr = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
-    foreach ($p in $pts) {
-        $x = $L + $pw * (($p.T - $begin).TotalHours / 24)
-        $y = $T + $ph * (1 - ($p.MB - $lo) / ($hi - $lo))
-        $arr.Add((New-Object Drawing.PointF([single]$x, [single]$y)))
-    }
-    $line = $arr.ToArray()
-    $area = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
-    $area.Add((New-Object Drawing.PointF($line[0].X, [single]($T + $ph)))); $area.AddRange($line); $area.Add((New-Object Drawing.PointF($line[$line.Length - 1].X, [single]($T + $ph))))
     $g.SetClip((New-Object Drawing.RectangleF([single]$L, [single]$T, [single]$pw, [single]$ph)))
-    $g.FillPolygon($GDI["fill$lvl"], $area.ToArray())
-    $g.DrawLines($GDI["glow$lvl"], $line)
-    $g.DrawLines($GDI["core$lvl"], $line)
+    $legendX = $w - 190
+    foreach ($ln in $lines) {
+        $lvl = [int]$ln.Level
+        $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+        for ($i = 0; $i -lt $ln.V.Length; $i++) {
+            if ($ln.T[$i] -lt $begin) { continue }
+            $x = $L + $pw * ($ln.T[$i] - $begin) / $spanT
+            $y = $T + $ph * (1 - ($ln.V[$i] - $lo) / ($hi - $lo))
+            $pts.Add((New-Object Drawing.PointF([single]$x, [single]$y)))
+        }
+        if ($pts.Count -lt 2) { continue }
+        $arr = $pts.ToArray()
+        if ($lines.Count -eq 1) {
+            $area = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+            $area.Add((New-Object Drawing.PointF($arr[0].X, [single]($T + $ph)))); $area.AddRange($arr); $area.Add((New-Object Drawing.PointF($arr[$arr.Length - 1].X, [single]($T + $ph))))
+            $g.FillPolygon($GDI["fill$lvl"], $area.ToArray())
+        }
+        $g.DrawLines($GDI["glow$lvl"], $arr)
+        $g.DrawLines($GDI["core$lvl"], $arr)
+        $ln.LastPt = $arr[$arr.Length - 1]
+    }
     $g.ResetClip()
-    $lp = $line[$line.Length - 1]
-    $g.FillRectangle($GDI["lv$lvl"], $lp.X - 4, $lp.Y - 4, 8, 8)
-    Txt $g ('{0:N0} MB' -f $pts[$pts.Count - 1].MB) $fTagB $LevelColor[$lvl] ($lp.X - 110) ($lp.Y - 26) 104 20 $tfR
+    # 末端数值 + 多条线时的图例
+    $ly = 50
+    foreach ($ln in $lines) {
+        if (-not $ln.LastPt) { continue }
+        $lvl = [int]$ln.Level; $lp = $ln.LastPt
+        $g.FillRectangle($GDI["lv$lvl"], $lp.X - 4, $lp.Y - 4, 8, 8)
+        $lastV = $ln.V[$ln.V.Length - 1]
+        $txt = ($fmt -f $lastV) + ' ' + $data.Unit
+        if ($lines.Count -gt 1) { $txt = $ln.Name + ' ' + $txt; Txt $g $txt $fTagB $LevelColor[$lvl] ($L + 8) $ly 160 18; $ly += 18 }
+        else { Txt $g $txt $fTagB $LevelColor[$lvl] ($lp.X - 130) ($lp.Y - 26) 124 20 $tfR }
+    }
+})
+$chart.Add_MouseClick({
+    param($s, $e)
+    if ($e.Y -lt 4 -or $e.Y -gt 30) { return }
+    foreach ($r in $script:rangeRects) { if ($e.X -ge $r[0] -and $e.X -lt $r[1]) { $script:chartRange = $r[2]; $chart.Invalidate(); break } }
 })
 $main.Controls.Add($lv)
-$main.Controls.Add((New-Object Windows.Forms.Panel -Property @{ Dock = 'Bottom'; Height = 6; BackColor = $cBg }))
+$main.Controls.Add((New-Object Windows.Forms.Panel -Property @{ Dock = 'Top'; Height = 8; BackColor = $cBg }))
 $main.Controls.Add($chart)
 $lv.BringToFront()
 
@@ -755,7 +1039,7 @@ $status.Add_Paint({
     $g.FillRectangle($GDI['bg'], 0, 0, $w, $h)
     $g.DrawLine($GDI['accDim'], 0, 0, $w, 0)
     $g.FillRectangle($GDI['acc'], 12, 10, 8, 8)
-    $txt = '每 5 秒刷新 · 最小化时暂停 · 本窗口：内存 {0:N0} MB / CPU {1:N2}% / GDI {2} · 后台检查：每 10 分钟约 5 秒，查完即退出 · 点列标题可切换排序' -f $script:selfMB, $script:selfCpu, $script:selfGdi
+    $txt = '每 5 秒刷新 · 最小化时暂停 · 本窗口：内存 {0:N0} MB / CPU {1:N2}% / GDI {2} · 实时数据 {3} 条 · 点卡片切换走势图 · 点列标题切换排序 · 右键程序可让看门狗监控它' -f $script:selfMB, $script:selfCpu, $script:selfGdi, $script:series.Count
     Txt $g $txt $fCN $cGray 28 0 ($w - 40) $h
 })
 
@@ -795,8 +1079,8 @@ function Path-Of($name) { $r = $script:rows[$name]; if ($r) { [NativeInfo]::Imag
 function Select-Target($name) {
     $script:selected = $name
     $script:updating = $true
-    try { foreach ($it in $lv.Items) { $it.Selected = ($it.Text -eq $name); if ($it.Selected) { $it.EnsureVisible() } } } finally { $script:updating = $false }
-    Update-DetailButtons; $detail.Invalidate(); $chart.Invalidate(); $lv.Invalidate()
+    try { foreach ($it in $lv.Items) { $sel = ($it.Text -eq $name); if ($it.Selected -ne $sel) { $it.Selected = $sel }; if ($sel) { $it.EnsureVisible() } } } finally { $script:updating = $false }
+    Update-DetailButtons; Set-ChartMode 'proc'; $detail.Invalidate()
 }
 
 # 重启一个程序（或服务）。$NoAsk 用于"一键修复"时已统一确认过。
@@ -863,7 +1147,7 @@ function Fix-All {
     foreach ($h in $script:hits) { if ($h.Rule.fix.type -ne 'none' -and -not $seen.ContainsKey($h.Target)) { $todo += , @($h.Rule.fix.label, $h); $seen[$h.Target] = 1 } }
     foreach ($r in $script:rows.Values) {
         if ($seen.ContainsKey($r.Name) -or $Protected -contains $r.Name) { continue }
-        if ((Get-Rating $r.Name $r.PrivMB).Text -eq '疑似泄漏') { $todo += , @(('重启 {0}（疑似泄漏）' -f $r.Name), $r.Name); $seen[$r.Name] = 1 }
+        if ($script:ratings[$r.Name].Text -eq '疑似泄漏' -and $script:ratings[$r.Name].Level -ge 2) { $todo += , @(('重启 {0}（疑似泄漏）' -f $r.Name), $r.Name); $seen[$r.Name] = 1 }
     }
     if (-not $todo) { Say '现在没有需要修复的问题。'; return }
     if (-not (Ask ("将依次执行：`n`n  " + (($todo | ForEach-Object { $_[0] }) -join "`n  ") + "`n`n相关程序里没保存的内容可能会丢失；部分操作需要管理员权限。确定吗？"))) { return }
@@ -876,9 +1160,49 @@ function Run-CheckNow {
     else { Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $ToolDir 'MemWatchdog.ps1')) }
     Reload-Soon
 }
+
+# ---- 个人规则文件（rules.local.json）读写：右键"用看门狗监控"就是往这里加一条规则 ----
+function Local-RulesPath { Join-Path $RulesDir 'rules.local.json' }
+function Read-LocalRules {
+    $p = Local-RulesPath
+    if (-not (Test-Path $p)) { return @() }
+    $list = @(); try { foreach ($r in (ConvertFrom-Json (Get-Content $p -Raw -Encoding UTF8))) { $list += $r } } catch { throw "rules.local.json 格式有误：$($_.Exception.Message)" }
+    $list
+}
+function Write-LocalRules($list) {
+    $json = ConvertTo-Json -InputObject @($list) -Depth 6
+    [IO.File]::WriteAllText((Local-RulesPath), $json, (New-Object Text.UTF8Encoding $false))
+    $script:rulesSig = ''; Load-Rules
+}
+function Add-Watch($name, [switch]$Auto) {
+    if (-not $name) { return }
+    $r = $script:rows[$name]; $cur = if ($r) { $r.PrivMB } else { 0 }
+    $default = [int]([math]::Ceiling([math]::Max($cur * 1.5, $cur + 300) / 100) * 100)
+    $what = if ($Auto) { '自动重启它' } else { '提醒你' }
+    $ans = [Microsoft.VisualBasic.Interaction]::InputBox(("让看门狗监控 {0}（现在 {1:N0} MB）。`n`n内存超过多少 MB 时{2}？`n`n看门狗每 10 分钟检查一次，也会专门记录它的内存走势。" -f $name, $cur, $what), 'WATCHDOG · 监控这个程序', [string]$default)
+    if (-not $ans) { return }
+    $limit = 0; if (-not [int]::TryParse($ans.Trim(), [ref]$limit) -or $limit -le 0) { Say '请输入一个正整数（单位 MB）。'; return }
+    try { $list = @(Read-LocalRules | Where-Object { $_.id -ne "watch-$name" }) } catch { Say $_.Exception.Message; return }
+    $fix = if ($name -like 'svc:*') { [ordered]@{ type = $(if ($Auto) { 'restartService' } else { 'none' }); service = $name.Substring(4); label = "重启服务 $($name.Substring(4))" } }
+           else { [ordered]@{ type = $(if ($Auto) { 'restartProcess' } else { 'none' }); label = $(if ($Auto) { "重启 $name" } else { "方便时手动重启 $name" }) } }
+    $list += [pscustomobject][ordered]@{
+        id = "watch-$name"; title = "$name 超过监控上限"; target = $name
+        when = [ordered]@{ process = $name; minMB = $limit }
+        cause = "你在监控窗口里设置的：内存超过 $limit MB 时$what。"
+        fix = $fix; auto = [bool]$Auto
+    }
+    Write-LocalRules $list
+    Say ("已加入看门狗监控：{0} 超过 {1} MB 时{2}。`n规则保存在 rules.local.json，可以随时在右键菜单里取消。" -f $name, $limit, $what)
+    Refresh-All
+}
+function Remove-Watch($name) {
+    try { $list = @(Read-LocalRules | Where-Object { $_.id -ne "watch-$name" }) } catch { Say $_.Exception.Message; return }
+    Write-LocalRules $list
+    Refresh-All
+}
 function Edit-Rules {
-    $p = Join-Path $RulesDir 'rules.local.json'
-    if (-not (Test-Path $p)) { Copy-Item (Join-Path $RulesDir 'rules.local.example.json') $p }
+    $p = Local-RulesPath
+    if (-not (Test-Path $p)) { [IO.File]::WriteAllText($p, "[]", (New-Object Text.UTF8Encoding $false)); Start-Process notepad.exe "`"$(Join-Path $RulesDir 'rules.local.example.json')`"" }
     Start-Process notepad.exe "`"$p`""
     $script:forceSlowAt = (Get-Date).AddSeconds(20)
 }
@@ -887,11 +1211,51 @@ function Edit-Rules {
 $menu = New-Object Windows.Forms.ContextMenuStrip
 $menu.Renderer = New-Object Windows.Forms.ToolStripProfessionalRenderer((New-Object CyberColors))
 $menu.Font = $fCN; $menu.ForeColor = $cText
-$menuFix = $menu.Items.Add('修复 / 重启'); $menuFix.ForeColor = $cText; $menuFix.Add_Click({ Fix-Selected })
-foreach ($m in @(@('结束这个程序', { Kill-Target $script:selected }), @('打开文件位置', { Open-Location $script:selected }))) {
-    $item = $menu.Items.Add($m[0]); $item.ForeColor = $cText; $item.Add_Click($m[1])
+function Menu-Item($text, $onClick) { $i = $menu.Items.Add($text); $i.ForeColor = $cText; $i.Add_Click($onClick); $i }
+$menuFix    = Menu-Item '修复 / 重启' { Fix-Selected }
+$menuKill   = Menu-Item '结束这个程序' { Kill-Target $script:selected }
+$menuOpen   = Menu-Item '打开文件位置' { Open-Location $script:selected }
+[void]$menu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
+$menuWatch  = Menu-Item '◉ 用看门狗监控（超过上限时提醒）' { Add-Watch $script:selected }
+$menuWatchA = Menu-Item '◉ 用看门狗监控（超过上限时自动重启）' { Add-Watch $script:selected -Auto }
+$menuUnwatch = Menu-Item '取消看门狗监控' { Remove-Watch $script:selected }
+[void]$menu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
+# 选中程序当前的问题：@(key, 标题)；没有问题返回 $null
+function Issue-Of($name) {
+    if (-not $name) { return $null }
+    $hit = $script:hitByTarget[$name]
+    if ($hit) { return , @("rule:$($hit.Rule.id)", $hit.Rule.title) }
+    $rt = $script:ratings[$name]
+    if ($rt -and $rt.Level -ge 1) { return , @("prog:$name", "$name $($rt.Text)") }
+    $r = $script:rows[$name]
+    if ($r -and $r.IoMBs -ge $HeavyIoMBs -and -not (Is-Ignored "io:$name")) { return , @("io:$name", "$name 正在大量读写") }
+    $null
 }
-$menu.Add_Opening({ param($s, $e); if (-not $script:selected) { $e.Cancel = $true } else { $menuFix.Text = $btnPrimary.Text } })
+function Has-Ignore($name) {
+    foreach ($k in $script:ignores.Keys) {
+        if (-not (Is-Ignored $k)) { continue }
+        if ($k -eq "prog:$name" -or $k -eq "io:$name") { return $true }
+        if ($k -like 'rule:*') { $r = $script:rules | Where-Object { "rule:$($_.id)" -eq $k } | Select-Object -First 1; if ($r -and ($r.target -eq $name -or $r.when.process -eq $name)) { return $true } }
+    }
+    $false
+}
+$menuSnooze = Menu-Item '忽略这个问题（24 小时内不提醒）' { $is = Issue-Of $script:selected; if ($is) { Ignore-Issue $is[0] $is[1] } }
+$menuNormal = Menu-Item '确认正常，不再提醒' { $is = Issue-Of $script:selected; if ($is -and (Ask ("确认「{0}」是正常的？以后不再提醒；如果是规则发现的，看门狗也不会再自动处理它。" -f $is[1]))) { Ignore-Issue $is[0] $is[1] -Normal } }
+$menuRestore = Menu-Item '恢复提醒' { Unignore-Name $script:selected }
+$menu.Add_Opening({
+    param($s, $e)
+    $n = $script:selected
+    if (-not $n) { $e.Cancel = $true; return }
+    $menuFix.Text = $btnPrimary.Text
+    $hasIssue = [bool](Issue-Of $n)
+    $menuSnooze.Visible = $hasIssue; $menuNormal.Visible = $hasIssue
+    $menuRestore.Visible = Has-Ignore $n
+    $isW = $script:watched.ContainsKey($n)
+    $menuUnwatch.Visible = $isW
+    $menuWatch.Text = if ($isW) { '◉ 修改监控（超过上限时提醒）' } else { '◉ 用看门狗监控（超过上限时提醒）' }
+    $menuWatchA.Text = if ($isW) { '◉ 修改监控（超过上限时自动重启）' } else { '◉ 用看门狗监控（超过上限时自动重启）' }
+    $menuWatchA.Visible = $Protected -notcontains $n
+})
 $lv.ContextMenuStrip = $menu
 
 # 选中程序的按钮：主按钮的文字随规则变化（命中规则时显示对应的修复方法）
@@ -901,7 +1265,8 @@ $btnOpen    = New-Btn $detail '打开位置' 185 234 163 { Open-Location $script
 function Update-DetailButtons {
     $name = $script:selected
     $hit = if ($name) { $script:hitByTarget[$name] } else { $null }
-    $btnPrimary.Text = if ($hit) { if ($hit.Rule.fix.type -eq 'none') { '查看建议：' + $hit.Rule.fix.label } else { '修复：' + $hit.Rule.fix.label } } elseif ($name -like 'svc:*') { '重启这个服务' } else { '重启这个程序' }
+    $t = if ($hit) { if ($hit.Rule.fix.type -eq 'none') { '查看建议：' + $hit.Rule.fix.label } else { '修复：' + $hit.Rule.fix.label } } elseif ($name -like 'svc:*') { '重启这个服务' } else { '重启这个程序' }
+    Set-Text $btnPrimary $t
 }
 
 # 操作区按钮（两列）
@@ -910,18 +1275,26 @@ $btnFix     = New-Btn $actions '一键修复全部问题' $ax $ay $full { Fix-Al
 $btnNow     = New-Btn $actions '立即检查一次' $ax $ay $half { Run-CheckNow }
 $btnNv      = New-Btn $actions '修复 NVIDIA 数据库' ($ax + $half + 8) $ay $half { if (Ask '将停止并重建 NVIDIA 的 nvtopps 数据库，屏幕可能闪一下。需要管理员权限。确定吗？') { Run-Tool 'Fix-NvTopps.ps1'; Reload-Soon } }; $ay += $step
 $btnRules   = New-Btn $actions '编辑我的规则' $ax $ay $half { Edit-Rules }
-$btnFolder  = New-Btn $actions '打开工具文件夹' ($ax + $half + 8) $ay $half { Start-Process explorer.exe "`"$ToolDir`"" }; $ay += $step
-$btnInstall = New-Btn $actions '安装看门狗（每 10 分钟自动检查）' $ax $ay $full {
+$btnIgnored = New-Btn $actions '已忽略的问题' ($ax + $half + 8) $ay $half { Show-Ignored }; $ay += $step
+$btnInstall = New-Btn $actions '安装看门狗' $ax $ay $half {
     if ($script:taskState) { if (Ask '将删除看门狗计划任务，之后不再自动检查。确定吗？') { Run-Tool 'Install-Watchdog.ps1' '-Uninstall' } }
     else { Run-Tool 'Install-Watchdog.ps1' }
     $script:forceSlowAt = (Get-Date).AddSeconds(15)
+}
+$btnFolder  = New-Btn $actions '打开工具文件夹' ($ax + $half + 8) $ay $half { Start-Process explorer.exe "`"$ToolDir`"" }
+function Active-Ignores { @($script:ignores.Values | Where-Object { Is-Ignored $_.key }) }
+function Show-Ignored {
+    $list = @(Active-Ignores)
+    if (-not $list) { Say '现在没有被忽略或确认正常的问题。'; return }
+    $lines = $list | ForEach-Object { '  · {0}（{1}）' -f $_.label, $(if ($_.type -eq 'normal') { '已确认正常' } else { '忽略到 ' + ([datetime]$_.until).ToString('MM-dd HH:mm') }) }
+    if (Ask ("下面这些问题现在不会提醒：`n`n" + ($lines -join "`n") + "`n`n要全部恢复提醒吗？")) { $script:ignores = @{}; Save-Ignores; Refresh-All }
 }
 
 # ---------- 刷新 ----------
 function Refresh-All {
     if ($form.WindowState -eq [Windows.Forms.FormWindowState]::Minimized) { return }
     $script:tick++
-    $now = Get-Date
+    $now = Get-Date; $nowU = [DateTime]::UtcNow
     if ($script:forceSlowAt -and $now -ge $script:forceSlowAt) { $script:forceSlowAt = $null; $script:lastSlow = [datetime]::MinValue; $script:histSig = ''; $script:rulesSig = '' }
     if (($now - $script:lastSlow).TotalSeconds -ge 60) { $script:lastSlow = $now; Update-Slow }
 
@@ -934,19 +1307,28 @@ function Refresh-All {
     $worst = [math]::Max($pct, $cpct)
     $lvl = if ($worst -lt 70) { 0 } elseif ($worst -lt 85) { 1 } else { 2 }
     Set-Card $cardMem ('{0:N1} / {1:N0} GB' -f $usedGB, $totalGB) ('{0}  {1:N0}%' -f (@('正常', '偏高', '紧张')[$lvl]), $pct) $lvl ('已提交 {0:N1} / {1:N0} GB · 70% 以下都算正常' -f $commitGB, $limitGB) $pct
+    Record 'sys:mem' $usedGB $nowU
 
     # 进程采样 + 规则
-    $script:cpuHist.Enqueue([NativeInfo]::Cpu())
+    $cpuNow = [NativeInfo]::Cpu()
+    $script:cpuHist.Enqueue($cpuNow)
     while ($script:cpuHist.Count -gt 6) { [void]$script:cpuHist.Dequeue() }
     $cpuAvg = ($script:cpuHist | Measure-Object -Average).Average
+    Record 'sys:cpu' $cpuNow $nowU
     $procs = Sample-Processes
     $rows = @($procs | Where-Object { $_.Name -ne 'Idle' -and $_.Name -ne 'Memory Compression' })
     $byName = @{}; foreach ($r in $rows) { $byName[$r.Name] = $r }
     $script:rows = $byName
+    $real = @($rows | Where-Object { $_.Name -notlike 'svc:*' })
+    # 实时数据：内存前 40 + 规则 / 监控涉及的 + 选中的
+    $rec = @{}
+    foreach ($r in @($real | Sort-Object PrivMB -Descending | Select-Object -First 40)) { $rec[$r.Name] = $r }
+    foreach ($r in $script:rules) { $p = $r.when.process; if ($p -and $byName.ContainsKey($p)) { $rec[$p] = $byName[$p] } }
+    if ($script:selected -and $byName.ContainsKey($script:selected)) { $rec[$script:selected] = $byName[$script:selected] }
+    foreach ($r in $rec.Values) { Record $r.Name $r.PrivMB $nowU }
     Eval-Rules
     $ratings = @{}; foreach ($r in $rows) { $ratings[$r.Name] = Get-Rating $r.Name $r.PrivMB }
     $script:ratings = $ratings
-    $real = @($rows | Where-Object { $_.Name -notlike 'svc:*' })
 
     # CPU（最近 30 秒平均）
     $busy = @($real | Sort-Object CpuPct -Descending | Select-Object -First 2)
@@ -956,92 +1338,97 @@ function Refresh-All {
     # 磁盘
     $script:disk = [DiskPerf]::Read()
     $rd = $script:disk[0] / 1MB; $wr = $script:disk[1] / 1MB; $busyPct = $script:disk[2]
+    Record 'sys:dr' $rd $nowU; Record 'sys:dw' $wr $nowU
     $topIo = @($real | Sort-Object IoMBs -Descending | Select-Object -First 1)
     $lvl = if ($busyPct -lt 60) { 0 } elseif ($busyPct -lt 90) { 1 } else { 2 }
     $ioSub = if ($topIo -and $topIo[0].IoMBs -ge 0.1) { '读写最多：{0} {1:N1} MB/s' -f $topIo[0].Name, $topIo[0].IoMBs } else { '没有程序在大量读写' }
     Set-Card $cardDisk ('R {0:N1}  W {1:N1} MB/s' -f $rd, $wr) ('{0}  {1:N0}%' -f (@('正常', '较忙', '很忙')[$lvl]), $busyPct) $lvl $ioSub $busyPct
-
-    # 看门狗
-    $last = if ($script:sys.Count -gt 0) { $script:sys[$script:sys.Count - 1] } else { $null }
-    if (-not $script:taskState) {
-        Set-Card $cardDog '未安装' '离线' 1 '在右侧"操作"里安装后每 10 分钟检查' -1
-    } elseif (-not $last) {
-        Set-Card $cardDog '等待首次检查' '待命' 1 '已安装，第一次检查完成后显示结果' -1
-    } else {
-        $lt = [datetime]::ParseExact($last.Time, 'yyyy-MM-dd HH:mm:ss', $null)
-        $mins = ($now - $lt).TotalMinutes
-        $ok = $mins -le 25
-        Set-Card $cardDog ('上次 ' + (Ago $lt)) $(if ($ok) { '运行中' } else { '可能停了' }) $(if ($ok) { 0 } else { 2 }) ('每次约 {0:N1} 秒 · 规则 {1} 条 · 进度条 = 距下次检查' -f ([double]$last.RunMs / 1000), $script:rules.Count) ([math]::Min(100, $mins * 10))
-    }
-
-    # 体检结论
-    $issues = @(); $seen = @{}
-    foreach ($h in $script:hits) {
-        $lv2 = if ($h.Rule.fix.type -eq 'none') { 1 } else { 2 }
-        $issues += [pscustomobject]@{ Title = $h.Rule.title; Sub = $h.Why; Level = $lv2; Target = $h.Target }; $seen[$h.Target] = 1
-    }
-    foreach ($r in $rows) {
-        if ($seen.ContainsKey($r.Name)) { continue }
-        $rt = $ratings[$r.Name]
-        $label = if ($Desc[$r.Name]) { '{0}（{1}）' -f $r.Name, $Desc[$r.Name] } else { $r.Name }
-        if ($rt.Text -eq '疑似泄漏') { $issues += [pscustomobject]@{ Title = "$label 疑似内存泄漏"; Sub = $rt.Note; Level = 2; Target = $r.Name } }
-        elseif ($rt.Text -eq '缓慢上涨') { $issues += [pscustomobject]@{ Title = "$label 在缓慢上涨"; Sub = $rt.Forecast; Level = 1; Target = $r.Name } }
-    }
-    foreach ($r in @($real | Where-Object { $_.IoMBs -ge $HeavyIoMBs } | Sort-Object IoMBs -Descending | Select-Object -First 2)) {
-        $issues += [pscustomobject]@{ Title = ('{0} 正在大量读写' -f $r.Name); Sub = ('{0:N0} MB/s。偶尔一下正常，一直这样要注意硬盘磨损。' -f $r.IoMBs); Level = 1; Target = $r.Name }
-    }
-    $issues = @($issues | Sort-Object { - $_.Level })
-    $nBad = @($issues | Where-Object { $_.Level -eq 2 }).Count; $nWarn = @($issues | Where-Object { $_.Level -eq 1 }).Count
-    $basis = '已分析 {0} 个程序的 24 小时记录 · 规则 {1} 条' -f $script:analysis.Count, $script:rules.Count
-    $script:verdict = if ($nBad) { @("发现 $nBad 个问题", 2, $basis) }
-        elseif ($nWarn) { @("有 $nWarn 项需要留意", 1, $basis) }
-        elseif ($script:hist.Count -eq 0) { @('数据收集中', 1, '看门狗每 10 分钟记录一次，约 2 小时后开始判断稳定性') }
-        else { @('电脑健康', 0, $basis) }
-    if ($script:lastAction -and $issues.Count -lt 3) { $issues += [pscustomobject]@{ Title = '看门狗最近一次动作'; Sub = $script:lastAction; Level = -1; Target = $null } }
-    $script:issues = $issues
-    $diag.Invalidate()
-
-    # 程序列表：内存前 25 + 有问题 / 需要留意 / 大量读写的；按当前排序方式排
-    $list = @($real | Sort-Object PrivMB -Descending | Select-Object -First 25)
-    $inList = @{}; foreach ($r in $list) { $inList[$r.Name] = 1 }
-    foreach ($r in $rows) { if (-not $inList.ContainsKey($r.Name) -and ($ratings[$r.Name].Level -ge 1 -or $r.IoMBs -ge $HeavyIoMBs)) { $list += $r; $inList[$r.Name] = 1 } }
-    $list = switch ($script:sortMode) {
-        'mem' { @($list | Sort-Object PrivMB -Descending) }
-        'cpu' { @($list | Sort-Object CpuPct -Descending) }
-        'io'  { @($list | Sort-Object IoMBs -Descending) }
-        default { @($list | Sort-Object @{ Expression = { $ratings[$_.Name].Score + $(if ($_.IoMBs -ge $HeavyIoMBs) { 40 } else { 0 }) }; Descending = $true }, @{ Expression = 'PrivMB'; Descending = $true }) }
-    }
-    $script:updating = $true
-    $lv.BeginUpdate()
-    try {
-        $lv.Items.Clear()
-        foreach ($r in $list) {
-            $rt = $ratings[$r.Name]
-            $it = New-Object Windows.Forms.ListViewItem($r.Name)
-            $it.Tag = [int]$rt.Level
-            [void]$it.SubItems.Add([string]$Desc[$r.Name])
-            [void]$it.SubItems.Add(('{0:N0}' -f $r.PrivMB))
-            [void]$it.SubItems.Add(('{0:N1}' -f $r.CpuPct))
-            [void]$it.SubItems.Add(('{0:N1}' -f $r.IoMBs))
-            [void]$it.SubItems.Add($rt.Text)
-            [void]$it.SubItems.Add((Trend-Text $r.Name))
-            [void]$it.SubItems.Add($(if ($rt.Forecast) { $rt.Forecast } else { $rt.Note }))
-            [void]$lv.Items.Add($it)
-            if ($r.Name -eq $script:selected) { $it.Selected = $true }
-        }
-    } finally { $lv.EndUpdate(); $script:updating = $false }
-    Fit-Columns
-    Update-DetailButtons
 
     # 本窗口自己的占用
     $me = [Diagnostics.Process]::GetCurrentProcess()
     try {
         $script:selfMB = $me.PrivateMemorySize64 / 1MB
         $script:selfGdi = [NativeInfo]::GetGuiResources($me.Handle, 0)
-        $cpuNow = $me.TotalProcessorTime.TotalMilliseconds; $tNow = [DateTime]::UtcNow
-        if ($script:selfPrevCpu) { $script:selfCpu = 100 * ($cpuNow - $script:selfPrevCpu[0]) / ($tNow - $script:selfPrevCpu[1]).TotalMilliseconds / [Environment]::ProcessorCount }
-        $script:selfPrevCpu = @($cpuNow, $tNow)
+        $c = $me.TotalProcessorTime.TotalMilliseconds
+        if ($script:selfPrevCpu) { $script:selfCpu = 100 * ($c - $script:selfPrevCpu[0]) / ($nowU - $script:selfPrevCpu[1]).TotalMilliseconds / [Environment]::ProcessorCount }
+        $script:selfPrevCpu = @($c, $nowU)
     } finally { $me.Dispose() }
+    Record 'sys:self' $script:selfMB $nowU
+
+    # 看门狗 + 自身占用
+    $last = if ($script:sys.Count -gt 0) { $script:sys[$script:sys.Count - 1] } else { $null }
+    $selfTxt = '本窗口 {0:N0} MB · CPU {1:N1}%' -f $script:selfMB, $script:selfCpu
+    if (-not $script:taskState) {
+        Set-Card $cardDog '未安装' '离线' 1 ($selfTxt + ' · 看门狗未安装') -1
+    } elseif (-not $last) {
+        Set-Card $cardDog '等待首次检查' '待命' 1 ($selfTxt + ' · 等待第一次检查') -1
+    } else {
+        $mins = ($now - $last.T).TotalMinutes
+        $ok = $mins -le 25
+        Set-Card $cardDog ('上次 ' + (Ago $last.T)) $(if ($ok) { '运行中' } else { '可能停了' }) $(if ($ok) { 0 } else { 2 }) ('{0} · 后台每次 {1:N1} 秒' -f $selfTxt, ([double]$last.RunMs / 1000)) ([math]::Min(100, $mins * 10))
+    }
+
+    # 体检结论
+    $issues = @(); $seen = @{}
+    foreach ($h in $script:hits) {
+        $lv2 = if ($h.Rule.fix.type -eq 'none') { 1 } else { 2 }
+        $issues += [pscustomobject]@{ Title = $h.Rule.title; Sub = $h.Why; Level = $lv2; Target = $h.Target; Key = "rule:$($h.Rule.id)" }; $seen[$h.Target] = 1
+    }
+    foreach ($r in $rows) {
+        if ($seen.ContainsKey($r.Name)) { continue }
+        $rt = $ratings[$r.Name]
+        $label = if ($Desc[$r.Name]) { '{0}（{1}）' -f $r.Name, $Desc[$r.Name] } else { $r.Name }
+        if ($rt.Level -lt 1) { continue }   # 正常的、或已被忽略 / 确认正常的
+        if ($rt.Text -eq '疑似泄漏') { $issues += [pscustomobject]@{ Title = "$label 疑似内存泄漏"; Sub = $rt.Note; Level = 2; Target = $r.Name; Key = "prog:$($r.Name)" } }
+        elseif ($rt.Text -eq '缓慢上涨') { $issues += [pscustomobject]@{ Title = "$label 在缓慢上涨"; Sub = $rt.Forecast; Level = 1; Target = $r.Name; Key = "prog:$($r.Name)" } }
+        elseif ($rt.Text -eq '短时上涨') { $st = $script:series[$r.Name].Stats(120); if ($st -and $st[2] -ge 100) { $issues += [pscustomobject]@{ Title = "$label 在上涨（观察中）"; Sub = $rt.Note; Level = 1; Target = $r.Name; Key = "prog:$($r.Name)" } } }
+    }
+    foreach ($r in @($real | Where-Object { $_.IoMBs -ge $HeavyIoMBs } | Sort-Object IoMBs -Descending | Select-Object -First 2)) {
+        if (Is-Ignored "io:$($r.Name)") { continue }
+    }
+    $issues = @($issues | Sort-Object { - $_.Level })
+    $nBad = @($issues | Where-Object { $_.Level -eq 2 }).Count; $nWarn = @($issues | Where-Object { $_.Level -eq 1 }).Count
+    $nLong = $script:analysis.Count
+    $nShort = @($ratings.Values | Where-Object { $_.Trend -like '*分钟' }).Count
+    $basis = '已评级 {0} 个程序（长期 {1} · 实时 {2}）· 规则 {3} 条' -f ($nLong + $nShort), $nLong, $nShort, $script:rules.Count
+    $script:verdict = if ($nBad) { @("发现 $nBad 个问题", 2, $basis) }
+        elseif ($nWarn) { @("有 $nWarn 项需要留意", 1, $basis) }
+        elseif (($nLong + $nShort) -eq 0) { @('数据收集中', 1, '窗口打开满 10 分钟后给出初步判断') }
+        else { @('电脑健康', 0, $basis) }
+    if ($script:lastAction -and $issues.Count -lt 3) { $issues += [pscustomobject]@{ Title = '看门狗最近一次动作'; Sub = $script:lastAction; Level = -1; Target = $null } }
+    $script:issues = $issues
+    $diag.Invalidate()
+
+    # 程序列表：内存前 25 + 有问题 / 需要留意 / 大量读写 / 被监控的；按当前排序方式排
+    $list = @($real | Sort-Object PrivMB -Descending | Select-Object -First 25)
+    $inList = @{}; foreach ($r in $list) { $inList[$r.Name] = 1 }
+    foreach ($r in $rows) { if (-not $inList.ContainsKey($r.Name) -and ($ratings[$r.Name].Level -ge 1 -or $r.IoMBs -ge $HeavyIoMBs -or $script:watched.ContainsKey($r.Name))) { $list += $r; $inList[$r.Name] = 1 } }
+    $list = switch ($script:sortMode) {
+        'mem' { @($list | Sort-Object PrivMB -Descending) }
+        'cpu' { @($list | Sort-Object CpuPct -Descending) }
+        'io'  { @($list | Sort-Object IoMBs -Descending) }
+        default { @($list | Sort-Object @{ Expression = { $ratings[$_.Name].Score + $(if ($_.IoMBs -ge $HeavyIoMBs) { 40 } else { 0 }) }; Descending = $true }, @{ Expression = 'PrivMB'; Descending = $true }) }
+    }
+    # 原地更新列表（不清空重建）：只改变了的格子，滚动位置和选中都保留，不闪
+    $script:updating = $true
+    $lv.BeginUpdate()
+    try {
+        while ($lv.Items.Count -gt $list.Count) { $lv.Items.RemoveAt($lv.Items.Count - 1) }
+        for ($i = 0; $i -lt $list.Count; $i++) {
+            $r = $list[$i]; $rt = $ratings[$r.Name]
+            if ($i -lt $lv.Items.Count) { $it = $lv.Items[$i] }
+            else { $it = New-Object Windows.Forms.ListViewItem(''); for ($k = 1; $k -lt 8; $k++) { [void]$it.SubItems.Add('') }; [void]$lv.Items.Add($it) }
+            $vals = @($r.Name, [string]$Desc[$r.Name], ('{0:N0}' -f $r.PrivMB), ('{0:N1}' -f $r.CpuPct), ('{0:N1}' -f $r.IoMBs), $rt.Text, $rt.Trend, $(if ($rt.Forecast) { $rt.Forecast } else { $rt.Note }))
+            for ($k = 0; $k -lt 8; $k++) { if ($it.SubItems[$k].Text -ne $vals[$k]) { $it.SubItems[$k].Text = $vals[$k] } }
+            if ([int]$it.Tag -ne [int]$rt.Level -or $null -eq $it.Tag) { $it.Tag = [int]$rt.Level }
+            $sel = $r.Name -eq $script:selected
+            if ($it.Selected -ne $sel) { $it.Selected = $sel }
+        }
+    } finally { $lv.EndUpdate(); $script:updating = $false }
+    Fit-Columns
+    Update-DetailButtons
+    $nIg = @(Active-Ignores).Count; Set-Text $btnIgnored $(if ($nIg) { "已忽略的问题（$nIg）" } else { '已忽略的问题' })
+
     $header.Invalidate(); $status.Invalidate(); $chart.Invalidate(); $detail.Invalidate()
 }
 
@@ -1051,6 +1438,8 @@ function Dispose-All {
     foreach ($f in $Fonts) { $f.Dispose() }
     foreach ($b in $script:icons.Values) { if ($b) { $b.Dispose() } }
     $rowH.Dispose(); $menu.Dispose()
+    if ($script:formIcon) { $script:formIcon.Dispose() }
+    if ($script:iconHandle -ne [IntPtr]::Zero) { [void][NativeInfo]::DestroyIcon($script:iconHandle) }
 }
 
 # 先取一次基准，CPU / 磁盘 / 读写速度才能算出差值
@@ -1062,6 +1451,18 @@ if ($SelfTest) {
     # 在屏幕外真实显示窗口，让所有控件都按正常流程创建和绘制
     $form.StartPosition = 'Manual'; $form.Location = New-Object Drawing.Point(-5000, -5000); $form.ShowInTaskbar = $false
     $form.Show(); [Windows.Forms.Application]::DoEvents()
+    if ($SimMinutes -gt 0) {
+        $rows0 = @(Sample-Processes | Where-Object { $_.Name -ne 'Idle' } | Sort-Object PrivMB -Descending | Select-Object -First 40)
+        $n = [math]::Min($RingSize, $SimMinutes * 12); $t0 = [DateTime]::UtcNow.AddMinutes(-$SimMinutes)
+        $rnd = New-Object Random 7
+        for ($i = 0; $i -lt $n; $i++) {
+            $t = $t0.AddSeconds($i * 5); $f = $i / [math]::Max(1, $n - 1)
+            foreach ($r in $rows0) { $v = if ($r.Name -eq $SimRising) { $r.PrivMB - 250 * (1 - $f) } else { $r.PrivMB * (1 + ($rnd.NextDouble() - 0.5) * 0.02) }; Record $r.Name $v $t }
+            Record 'sys:mem' (19 + $f + $rnd.NextDouble() * 0.3) $t; Record 'sys:cpu' (20 + 15 * [math]::Sin($i / 20) + $rnd.NextDouble() * 8) $t
+            Record 'sys:dr' ([math]::Max(0, $rnd.NextDouble() * 3 - 1)) $t; Record 'sys:dw' ([math]::Max(0, $rnd.NextDouble() * 6 - 2 + $(if ($i % 90 -lt 5) { 40 } else { 0 }))) $t
+            Record 'sys:self' (128 + $rnd.NextDouble() * 4) $t
+        }
+    }
     $bmp = New-Object Drawing.Bitmap($form.Width, $form.Height)
     $rect = New-Object Drawing.Rectangle(0, 0, $form.Width, $form.Height)
     $mem = @()
@@ -1072,17 +1473,17 @@ if ($SelfTest) {
         if ($i -eq [math]::Min(20, $Loops) -or $i -eq $Loops -or $i % 150 -eq 0) {
             [GC]::Collect(); [GC]::WaitForPendingFinalizers()
             $me = [Diagnostics.Process]::GetCurrentProcess()
-            $mem += '第 {0} 次刷新+重绘后：本程序 {1:N1} MB，托管堆 {2:N1} MB，句柄 {3}，GDI 对象 {4}，USER 对象 {5}，图标缓存 {6}' -f $i, ($me.PrivateMemorySize64 / 1MB), ([GC]::GetTotalMemory($true) / 1MB), $me.HandleCount, [NativeInfo]::GetGuiResources($me.Handle, 0), [NativeInfo]::GetGuiResources($me.Handle, 1), $script:icons.Count
+            $mem += '第 {0} 次刷新+重绘后：本程序 {1:N1} MB，托管堆 {2:N1} MB，句柄 {3}，GDI 对象 {4}，USER 对象 {5}，图标缓存 {6}，实时数据 {7} 条' -f $i, ($me.PrivateMemorySize64 / 1MB), ([GC]::GetTotalMemory($true) / 1MB), $me.HandleCount, [NativeInfo]::GetGuiResources($me.Handle, 0), [NativeInfo]::GetGuiResources($me.Handle, 1), $script:icons.Count, $script:series.Count
             $me.Dispose()
         }
     }
     if ($Snapshot) { $bmp.Save($Snapshot, [Drawing.Imaging.ImageFormat]::Png) }
     $bmp.Dispose()
-    foreach ($c in @($cardMem, $cardCpu, $cardDisk, $cardDog)) { '{0}: {1} [{2}] {3}' -f $c.Tag.Tag, $c.Tag.Value, $c.Tag.Badge, $c.Tag.Sub }
+    foreach ($c in $CardList) { '{0}: {1} [{2}] {3}' -f $c.Tag.Tag, $c.Tag.Value, $c.Tag.Badge, $c.Tag.Sub }
     '结论: {0} | {1}' -f $script:verdict[0], $script:verdict[2]
     foreach ($is in $script:issues) { '  - [{0}] {1} | {2} | -> {3}' -f $is.Level, $is.Title, $is.Sub, $is.Target }
     '评级:'
-    foreach ($k in ($script:ratings.Keys | Where-Object { $script:ratings[$_].Text -ne '数据不足' -and $script:ratings[$_].Text -ne '稳定' })) { '  {0}: {1} | {2} | {3}' -f $k, $script:ratings[$k].Text, $script:ratings[$k].Note, $script:ratings[$k].Forecast }
+    foreach ($k in ($script:ratings.Keys | Where-Object { $script:ratings[$_].Text -ne '数据不足' })) { '  {0}: {1}(级别 {5}, {6}) | {2} | {3} | {4}' -f $k, $script:ratings[$k].Text, $script:ratings[$k].Trend, $script:ratings[$k].Note, $script:ratings[$k].Forecast, $script:ratings[$k].Level, $script:ratings[$k].Level.GetType().Name }
     '主按钮: ' + $btnPrimary.Text
     '--- 自身资源 ---'
     $mem

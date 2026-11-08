@@ -30,6 +30,21 @@ function Load-Rules {
     $all
 }
 
+# ignore.json (written by MemMonitor): problems the user chose to ignore for 24 h or confirmed as normal.
+# A rule whose key "rule:<id>" is ignored is not fixed automatically.
+function Load-Ignored {
+    $set = @{}
+    $p = Join-Path $PSScriptRoot 'ignore.json'
+    if (-not (Test-Path $p)) { return $set }
+    try {
+        foreach ($i in (ConvertFrom-Json (Get-Content $p -Raw -Encoding UTF8))) {
+            if ($i.type -eq 'snooze' -and [datetime]$i.until -lt (Get-Date)) { continue }
+            $set[$i.key] = $i
+        }
+    } catch { Log ("IGNORE FILE ERROR: {0}" -f $_.Exception.Message) }
+    $set
+}
+
 # Current private memory of a rule's process ("svc:Name" = the process hosting that service). $null = not running.
 function Get-TargetMB($name) {
     if ($name -like 'svc:*') {
@@ -83,10 +98,12 @@ function Invoke-Fix($r) {
 
 # ---- Check every rule ----
 $rules = @(Load-Rules)
+$ignored = Load-Ignored
 $fixedTargets = @{}
 foreach ($r in $rules) {
     $why = Test-Rule $r
     if (-not $why) { Write-Host ("ok   {0}" -f $r.id); continue }
+    if ($ignored.ContainsKey("rule:$($r.id)")) { Write-Host ("skip {0}: ignored by user ({1})" -f $r.id, $why); continue }
     if (-not $r.auto -or $r.fix.type -eq 'none') { Log ("NOTICE {0}: {1} ({2})" -f $r.id, $r.title, $why); continue }
     # one fix per target per run (e.g. the NVIDIA database rebuild already restarts the container)
     if ($fixedTargets.ContainsKey($r.target)) { Write-Host ("skip {0}: {1} already fixed this run" -f $r.id, $r.target); continue }
@@ -125,6 +142,10 @@ $os  = Get-CimInstance Win32_OperatingSystem
 $cpu = [int](Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
 $nvDb = 'C:\ProgramData\NVIDIA Corporation\nvtopps\nvtopps.db3'
 $dbNow = if (Test-Path $nvDb) { [int]((Get-Item $nvDb).Length / 1MB) } else { 0 }
+$disk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction SilentlyContinue
+# sysv3 = sys + disk + the watchdog's own CPU time and peak memory
+# (new file name each time columns change, because Export-Csv can't append rows with new columns to an old file)
+$self = Get-Process -Id $PID
 [pscustomobject]@{
     Time          = $stamp
     UsedMB        = [int](($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1KB)
@@ -133,7 +154,11 @@ $dbNow = if (Test-Path $nvDb) { [int]((Get-Item $nvDb).Length / 1MB) } else { 0 
     CommitLimitMB = [int]($os.TotalVirtualMemorySize / 1KB)
     CpuPct        = $cpu
     NvToppsMB     = $dbNow
+    DiskReadMBs   = if ($disk) { [math]::Round($disk.DiskReadBytesPersec / 1MB, 2) } else { 0 }
+    DiskWriteMBs  = if ($disk) { [math]::Round($disk.DiskWriteBytesPersec / 1MB, 2) } else { 0 }
+    SelfCpuSec    = [math]::Round($self.TotalProcessorTime.TotalSeconds, 2)
+    SelfPeakMB    = [int]($self.PeakWorkingSet64 / 1MB)
     RunMs         = $sw.ElapsedMilliseconds
-} | Export-Csv -Path (Join-Path $dataDir "sys-$day.csv") -Append -NoTypeInformation -Encoding UTF8
+} | Export-Csv -Path (Join-Path $dataDir "sysv3-$day.csv") -Append -NoTypeInformation -Encoding UTF8
 
 Get-ChildItem $dataDir -Filter '*.csv' | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$HistoryDays) } | Remove-Item -Force -ErrorAction SilentlyContinue

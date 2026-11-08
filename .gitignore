@@ -3,3 +3,8 @@ data/
 *.log
 # Your own rules
 rules.local.json
+# Built by Build-Exe.ps1
+WatchDog.exe
+WatchDog.ico
+# Problems you ignored / confirmed normal
+ignore.json
