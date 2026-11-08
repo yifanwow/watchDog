@@ -112,6 +112,12 @@ public class Ring {
     }
     public int Count { get { return n; } }
     public long TimeAt(int k) { return t[(head + k) % cap]; }
+    // 存盘 / 读回：关掉窗口再打开，之前的实时记录还在
+    public void Save(System.IO.BinaryWriter w) { w.Write(n); for (int k = 0; k < n; k++) { w.Write(TimeAt(k)); w.Write(ValueAt(k)); } }
+    public void Load(System.IO.BinaryReader r, long minTicks) {
+        int c = r.ReadInt32();
+        for (int k = 0; k < c; k++) { long tt = r.ReadInt64(); float vv = r.ReadSingle(); if (tt >= minTicks) Add(new DateTime(tt, DateTimeKind.Utc), vv); }
+    }
     public float ValueAt(int k) { return v[(head + k) % cap]; }
     // 内存趋势（只看最近一次重启之后：值骤降 40% 以上或断档超过 gapSec 秒视为重启）
     // 返回 [每小时变化 MB, R², 累计变化, 时长(小时), 波动系数, 点数]；数据不够返回 null
@@ -193,6 +199,8 @@ $ShortSlopeMBh = 60; $ShortGrowthMB = 30; $ShortR2 = 0.8   # 短时上涨
 $WobbleCv     = 0.15   # 波动大：波动幅度超过平均值的 15%
 $HeavyIoMBs   = 30     # 单个程序读写超过这个速度会提示
 $RingSize     = 720    # 每条实时数据最多 720 个点（5 秒一个 = 1 小时）
+$GapSec       = 1800   # 实时数据中断超过 30 分钟，当作程序重启过，只看中断之后的数据
+$LiveFile     = Join-Path $DataDir 'live.bin'   # 实时数据存盘，关掉再打开还能看到之前的记录
 $MaxSeries    = 150    # 最多同时记录 150 条
 
 # ---------- 状态（每次刷新都整体替换，不累积） ----------
@@ -307,7 +315,7 @@ function Update-Slow {
     foreach ($r in $script:rules) { $f = $r.when.file; if ($f -and -not $fm.ContainsKey($f)) { $fm[$f] = if (Test-Path -LiteralPath $f) { [int]((Get-Item -LiteralPath $f).Length / 1MB) } else { $null } } }
     $script:fileMB = $fm
     # 15 分钟没出现的程序，丢掉它的实时数据
-    $old = (Get-Date).AddMinutes(-15)
+    $old = [DateTime]::UtcNow.AddMinutes(-15)   # 实时数据存的是 UTC 时间
     foreach ($k in @($script:series.Keys)) { if ($k -notlike 'sys:*' -and $script:series[$k].LastSeen -lt $old) { $script:series.Remove($k) } }
     if ($btnInstall) { Set-Text $btnInstall $(if ($script:taskState) { '卸载看门狗' } else { '安装看门狗' }) }
 }
@@ -469,7 +477,7 @@ function Get-RatingRaw($name, $mb) {
         return (New-Rating '稳定' 0 0 ('近 {0:N1} 小时平稳' -f $a.Span) '' $trend)
     }
     $ring = $script:series[$name]
-    $st = if ($ring) { $ring.Stats(120) } else { $null }
+    $st = if ($ring) { $ring.Stats($GapSec) } else { $null }
     if ($st -and $st[3] -ge $ShortMinHours) {
         $mins = $st[3] * 60
         $trend = '{0:+#,0;-#,0;0} MB / {1:N0} 分钟' -f $st[2], $mins
@@ -1051,7 +1059,7 @@ $status.Add_Paint({
     $g.FillRectangle($GDI['bg'], 0, 0, $w, $h)
     $g.DrawLine($GDI['accDim'], 0, 0, $w, 0)
     $g.FillRectangle($GDI['acc'], 12, 10, 8, 8)
-    $txt = '每 5 秒刷新 · 最小化时暂停 · 本窗口：内存 {0:N0} MB / CPU {1:N2}% / GDI {2} · 实时数据 {3} 条 · 点卡片切换走势图 · 点列标题切换排序 · 右键程序可让看门狗监控它' -f $script:selfMB, $script:selfCpu, $script:selfGdi, $script:series.Count
+    $txt = '每 5 秒刷新 · 最小化到托盘后继续记录 · 本窗口：内存 {0:N0} MB / CPU {1:N2}% / GDI {2} · 实时数据 {3} 条 · 点卡片切换走势图 · 点列标题切换排序 · 右键程序可让看门狗监控它' -f $script:selfMB, $script:selfCpu, $script:selfGdi, $script:series.Count
     Txt $g $txt $fCN $cGray 28 0 ($w - 40) $h
 })
 
@@ -1304,8 +1312,10 @@ function Show-Ignored {
 
 # ---------- 刷新 ----------
 function Refresh-All {
-    if ($form.WindowState -eq [Windows.Forms.FormWindowState]::Minimized) { return }
+    # 缩小到托盘（窗口隐藏）时照常记录；只有"最小化但没进托盘"的一瞬间跳过
+    if ($form.Visible -and $form.WindowState -eq [Windows.Forms.FormWindowState]::Minimized) { return }
     $script:tick++
+    if ($script:tick % 60 -eq 0 -and -not $SelfTest) { Save-Live }   # 每 5 分钟存一次盘，防止意外关机丢数据
     $now = Get-Date; $nowU = [DateTime]::UtcNow
     if ($script:forceSlowAt -and $now -ge $script:forceSlowAt) { $script:forceSlowAt = $null; $script:lastSlow = [datetime]::MinValue; $script:histSig = ''; $script:rulesSig = '' }
     if (($now - $script:lastSlow).TotalSeconds -ge 60) { $script:lastSlow = $now; Update-Slow }
@@ -1320,6 +1330,7 @@ function Refresh-All {
     $lvl = if ($worst -lt 70) { 0 } elseif ($worst -lt 85) { 1 } else { 2 }
     Set-Card $cardMem ('{0:N1} / {1:N0} GB' -f $usedGB, $totalGB) ('{0}  {1:N0}%' -f (@('正常', '偏高', '紧张')[$lvl]), $pct) $lvl ('已提交 {0:N1} / {1:N0} GB · 70% 以下都算正常' -f $commitGB, $limitGB) $pct
     Record 'sys:mem' $usedGB $nowU
+    if ($tray) { $tray.Text = 'WatchDog · 内存 {0:N1} / {1:N0} GB ({2:N0}%)' -f $usedGB, $totalGB, $pct }
 
     # 进程采样 + 规则
     $cpuNow = [NativeInfo]::Cpu()
@@ -1393,7 +1404,7 @@ function Refresh-All {
         if ($rt.Level -lt 1) { continue }   # 正常的、或已被忽略 / 确认正常的
         if ($rt.Text -eq '疑似泄漏') { $issues += [pscustomobject]@{ Title = "$label 疑似内存泄漏"; Sub = $rt.Note; Level = 2; Target = $r.Name; Key = "prog:$($r.Name)" } }
         elseif ($rt.Text -eq '缓慢上涨') { $issues += [pscustomobject]@{ Title = "$label 在缓慢上涨"; Sub = $rt.Forecast; Level = 1; Target = $r.Name; Key = "prog:$($r.Name)" } }
-        elseif ($rt.Text -eq '短时上涨') { $st = $script:series[$r.Name].Stats(120); if ($st -and $st[2] -ge 100) { $issues += [pscustomobject]@{ Title = "$label 在上涨（观察中）"; Sub = $rt.Note; Level = 1; Target = $r.Name; Key = "prog:$($r.Name)" } } }
+        elseif ($rt.Text -eq '短时上涨') { $st = $script:series[$r.Name].Stats($GapSec); if ($st -and $st[2] -ge 100) { $issues += [pscustomobject]@{ Title = "$label 在上涨（观察中）"; Sub = $rt.Note; Level = 1; Target = $r.Name; Key = "prog:$($r.Name)" } } }
     }
     foreach ($r in @($real | Where-Object { $_.IoMBs -ge $HeavyIoMBs } | Sort-Object IoMBs -Descending | Select-Object -First 2)) {
         if (Is-Ignored "io:$($r.Name)") { continue }
@@ -1455,6 +1466,65 @@ function Dispose-All {
     if ($script:iconHandle -ne [IntPtr]::Zero) { [void][NativeInfo]::DestroyIcon($script:iconHandle) }
 }
 
+# ---------- 实时数据存盘：关掉再打开，之前的记录还在 ----------
+# 格式：'WDL1'、条数，然后每条：名字、点数、每个点（时间 ticks, 值）。先写临时文件再替换，写一半断电也不会坏
+function Save-Live {
+    try {
+        if (-not (Test-Path $DataDir)) { [void](New-Item -ItemType Directory -Path $DataDir) }
+        $tmp = $LiveFile + '.tmp'
+        $fs = [IO.File]::Create($tmp); $w = New-Object IO.BinaryWriter($fs)
+        try {
+            $w.Write([int]0x314C4457); $w.Write([int]$script:series.Count)
+            foreach ($k in $script:series.Keys) { $w.Write([string]$k); $script:series[$k].Save($w) }
+        } finally { $w.Dispose(); $fs.Dispose() }
+        if (Test-Path $LiveFile) { [IO.File]::Delete($LiveFile) }
+        [IO.File]::Move($tmp, $LiveFile)
+    } catch { }
+}
+function Load-Live {
+    if (-not (Test-Path $LiveFile)) { return }
+    $minT = [DateTime]::UtcNow.AddSeconds(-5 * $RingSize).Ticks   # 只读回最近 1 小时内的点（再早的走势图用看门狗的记录）
+    $fs = $null; $rd = $null
+    try {
+        $fs = [IO.File]::OpenRead($LiveFile); $rd = New-Object IO.BinaryReader($fs)
+        if ($rd.ReadInt32() -ne 0x314C4457) { return }
+        $cnt = $rd.ReadInt32()
+        for ($i = 0; $i -lt $cnt; $i++) {
+            $name = $rd.ReadString(); $r = New-Object Ring($RingSize); $r.Load($rd, $minT)
+            if ($r.Count -gt 0 -and $script:series.Count -lt $MaxSeries) { $script:series[$name] = $r }
+        }
+    } catch { } finally { if ($rd) { $rd.Dispose() }; if ($fs) { $fs.Dispose() } }
+}
+
+# ---------- 托盘：最小化时缩到托盘，在后台继续记录 ----------
+$tray = $null
+if (-not $SelfTest) {
+    $tray = New-Object Windows.Forms.NotifyIcon
+    $tray.Icon = $script:formIcon; $tray.Text = 'WatchDog'; $tray.Visible = $false
+    $trayMenu = New-Object Windows.Forms.ContextMenuStrip
+    $trayMenu.Renderer = $menu.Renderer; $trayMenu.BackColor = $menu.BackColor
+    $ti = $trayMenu.Items.Add('打开 WatchDog'); $ti.ForeColor = $cText; $ti.Font = $fCNb; $ti.Add_Click({ Show-FromTray })
+    $ti = $trayMenu.Items.Add('退出'); $ti.ForeColor = $cText; $ti.Add_Click({ $form.Close() })
+    $tray.ContextMenuStrip = $trayMenu
+    $tray.Add_MouseClick({ param($s, $e); if ($e.Button -eq [Windows.Forms.MouseButtons]::Left) { Show-FromTray } })
+    $script:lastState = [Windows.Forms.FormWindowState]::Normal; $script:trayTipShown = $false
+    $form.Add_Resize({
+        if ($form.WindowState -eq [Windows.Forms.FormWindowState]::Minimized) {
+            if ($form.Visible) {
+                $form.Hide(); $tray.Visible = $true
+                if (-not $script:trayTipShown) { $script:trayTipShown = $true; $tray.ShowBalloonTip(3000, 'WatchDog 在托盘里继续记录', '点托盘图标重新打开，右键可以退出。', [Windows.Forms.ToolTipIcon]::Info) }
+            }
+        } else { $script:lastState = $form.WindowState }
+    })
+}
+function Show-FromTray {
+    $form.Show(); $form.WindowState = $script:lastState; $form.Activate()
+    if ($tray) { $tray.Visible = $false }
+    Refresh-All
+}
+
+if ($SimMinutes -eq 0) { Load-Live }   # 自测用模拟数据时不读、也不存，免得混进真实记录
+
 # 先取一次基准，CPU / 磁盘 / 读写速度才能算出差值
 [void][DiskPerf]::Open()
 [void][NativeInfo]::Cpu(); [void](Sample-Processes)
@@ -1500,6 +1570,7 @@ if ($SelfTest) {
     '主按钮: ' + $btnPrimary.Text
     '--- 自身资源 ---'
     $mem
+    if ($SimMinutes -eq 0) { Save-Live; '实时数据已存盘: {0:N0} KB' -f ((Get-Item $LiveFile).Length / 1KB) }
     $form.Close(); $form.Dispose(); Dispose-All
     return
 }
@@ -1508,7 +1579,12 @@ $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 5000
 $timer.Add_Tick({ Refresh-All })
 $form.Add_Shown({ Start-Sleep -Milliseconds 300; Refresh-All; $timer.Start() })
-$form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() })
-[void]$form.ShowDialog()
+$form.Add_FormClosed({
+    $timer.Stop(); $timer.Dispose()
+    Save-Live
+    if ($tray) { $tray.Visible = $false; $tray.Dispose(); $trayMenu.Dispose() }   # 不留下"幽灵"托盘图标
+})
+# 用 Application.Run 而不是 ShowDialog：对话框窗口一隐藏就会结束，没法缩到托盘
+[Windows.Forms.Application]::Run($form)
 $form.Dispose()
 Dispose-All
