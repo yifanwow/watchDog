@@ -5,7 +5,7 @@
 # 只在打开时运行，关掉窗口就完全退出。每 5 秒刷新一次。
 # 实时数据存在固定大小的环形缓存里（每条最多 1 小时 / 720 个点，最多 150 条），不会越用越大。
 # 所有画笔 / 画刷 / 字体只在启动时创建一次；系统句柄（进程、磁盘计数器）用完立即关闭；图标缓存有上限。
-#   -SelfTest -Loops N [-Snapshot x.png] [-Select 程序名] [-StartChart mem|cpu|disk|dog|proc] : 在屏幕外显示窗口，连续刷新并重绘 N 次
+#   -SelfTest -Loops N [-Snapshot x.png] [-Select 程序名] [-StartChart mem|cpu|disk|dog|proc] [-StartRange 30m|1h|3h|12h|24h] : 在屏幕外显示窗口，连续刷新并重绘 N 次
 param(
     [string]$DataDir = (Join-Path $PSScriptRoot 'data'),
     [string]$RulesDir = $PSScriptRoot,
@@ -13,7 +13,8 @@ param(
     [int]$Loops = 1,
     [string]$Snapshot,
     [string]$Select,
-    [string]$StartChart = 'proc',
+    [string]$StartChart = 'mem',
+    [string]$StartRange = '30m',
     [int]$SimMinutes = 0,         # 仅自测：预先填入最近 N 分钟的模拟实时数据
     [string]$SimRising = ''       # 仅自测：让这个程序在模拟数据里持续上涨
 )
@@ -203,7 +204,10 @@ $script:svcPid    = @{}; $script:taskState = $null; $script:lastAction = ''
 $script:rules     = @(); $script:rulesSig = ''; $script:fileMB = @{}; $script:watched = @{}
 $script:hits      = @(); $script:hitByTarget = @{}
 $script:selected  = if ($Select) { $Select } else { $null }
-$script:chartMode = $StartChart; $script:chartRange = 'auto'; $script:rangeRects = @()
+$script:chartMode = $StartChart; $script:chartRange = $StartRange; $script:rangeRects = @()
+# 走势图可选的时间范围（小时）。默认近 30 分钟
+$RangeHours = [ordered]@{ '30m' = 0.5; '1h' = 1; '3h' = 3; '12h' = 12; '24h' = 24 }
+$RangeLabel = @{ '30m' = '30 分钟'; '1h' = '1 小时'; '3h' = '3 小时'; '12h' = '12 小时'; '24h' = '24 小时' }
 $script:updating  = $false; $script:tick = 0; $script:sortMode = 'issue'
 $script:selfMB = 0; $script:selfGdi = 0; $script:selfCpu = 0.0; $script:selfPrevCpu = $null
 $script:issues    = @(); $script:verdict = @('正在检查…', -1, ''); $script:issueRects = @()
@@ -696,7 +700,7 @@ function Set-Card($card, $value, $badge, [int]$level, $sub, [double]$pct) {
     $card.Invalidate()
 }
 function Set-ChartMode($mode) {
-    $script:chartMode = $mode; $script:chartRange = 'auto'
+    $script:chartMode = $mode   # 时间范围保持用户上次选的
     foreach ($c in $CardList) { $c.Invalidate() }
     $chart.Invalidate()
 }
@@ -899,17 +903,18 @@ function Hist-Line($items, $getter, $level, $label) {
 # 按当前模式取数据：返回 @{ Title; Unit; Lines; Note; FixedMax }
 function Get-ChartData($range) {
     $m = $script:chartMode
+    $long = $RangeHours[$range] -gt 1   # 1 小时以内用窗口的实时数据（5 秒一个点），更长用看门狗的记录（10 分钟一个点）
     switch ($m) {
         'mem' {
-            if ($range -eq '24h') { return @{ Title = '整机内存占用'; Unit = 'GB'; Lines = @(Hist-Line $script:sys { param($x) [double]$x.UsedMB / 1024 } 0 '已用'); Note = '看门狗每 10 分钟记录一次' } }
+            if ($long) { return @{ Title = '整机内存占用'; Unit = 'GB'; Lines = @(Hist-Line $script:sys { param($x) [double]$x.UsedMB / 1024 } 0 '已用'); Note = '看门狗每 10 分钟记录一次' } }
             return @{ Title = '整机内存占用'; Unit = 'GB'; Lines = @(Ring-Line 'sys:mem' 0 '已用'); Note = '窗口打开期间每 5 秒一个点' }
         }
         'cpu' {
-            if ($range -eq '24h') { return @{ Title = 'CPU 占用'; Unit = '%'; FixedMax = 100; Lines = @(Hist-Line $script:sys { param($x) [double]$x.CpuPct } 0 'CPU'); Note = '看门狗检查时的瞬间值' } }
+            if ($long) { return @{ Title = 'CPU 占用'; Unit = '%'; FixedMax = 100; Lines = @(Hist-Line $script:sys { param($x) [double]$x.CpuPct } 0 'CPU'); Note = '看门狗检查时的瞬间值' } }
             return @{ Title = 'CPU 占用'; Unit = '%'; FixedMax = 100; Lines = @(Ring-Line 'sys:cpu' 0 'CPU'); Note = '窗口打开期间每 5 秒一个点' }
         }
         'disk' {
-            if ($range -eq '24h') {
+            if ($long) {
                 $v2 = @($script:sys | Where-Object { $null -ne $_.DiskWriteMBs })
                 return @{ Title = '磁盘读写'; Unit = 'MB/s'; Lines = @((Hist-Line $v2 { param($x) [double]$x.DiskReadMBs } 0 '读'), (Hist-Line $v2 { param($x) [double]$x.DiskWriteMBs } 1 '写')); Note = '看门狗检查时的瞬间值' }
             }
@@ -917,14 +922,14 @@ function Get-ChartData($range) {
         }
         'dog' {
             $what = '看门狗做什么：每 10 分钟在后台运行约 5 秒 → ① 按规则检查，超过上限的自动修复  ② 记录各程序内存，用来判断稳定性 → 然后退出，不常驻内存'
-            if ($range -eq '24h') { return @{ Title = '看门狗每次检查耗时'; Unit = '秒'; Lines = @(Hist-Line $script:sys { param($x) [double]$x.RunMs / 1000 } 0 '耗时'); Note = $what } }
+            if ($long) { return @{ Title = '看门狗每次检查耗时'; Unit = '秒'; Lines = @(Hist-Line $script:sys { param($x) [double]$x.RunMs / 1000 } 0 '耗时'); Note = $what } }
             return @{ Title = '本监控窗口自身内存'; Unit = 'MB'; Lines = @(Ring-Line 'sys:self' 0 '本窗口'); Note = $what }
         }
         default {
             $name = $script:selected
             if (-not $name) { return @{ Title = ''; Lines = @(); Note = '点选列表里的程序看它的内存走势；点上面的卡片看整机内存 / CPU / 磁盘 / 看门狗' } }
             $label = '{0}  ·  {1}' -f $name, $(if ($Desc[$name]) { $Desc[$name] } else { '-' })
-            if ($range -eq '24h') { return @{ Title = $label; Unit = 'MB'; Lines = @(Hist-Line $script:hist[$name] { param($x) $x.MB } 0 '内存'); Note = '看门狗每 10 分钟记录一次' } }
+            if ($long) { return @{ Title = $label; Unit = 'MB'; Lines = @(Hist-Line $script:hist[$name] { param($x) $x.MB } 0 '内存'); Note = '看门狗每 10 分钟记录一次' } }
             return @{ Title = $label; Unit = 'MB'; Lines = @(Ring-Line $name 0 '内存'); Note = '窗口打开期间每 5 秒一个点' }
         }
     }
@@ -939,46 +944,53 @@ $chart.Add_Paint({
     Scanlines $g $w $h
     $g.DrawPolygon($GDI['accPen'], $poly)
     $g.FillRectangle($GDI['acc'], 0, 0, 46, 4)
-    # 时间范围：auto = 选中程序有 24 小时记录就用 24 小时，否则 1 小时
     $range = $script:chartRange
-    if ($range -eq 'auto') { $range = if ($script:chartMode -eq 'proc' -and $script:selected -and $script:hist.ContainsKey($script:selected) -and $script:hist[$script:selected].Count -ge 2) { '24h' } else { '1h' } }
+    if (-not $RangeHours.Contains($range)) { $range = '30m' }
     $data = Get-ChartData $range
     Txt $g '// TREND' $fTagB $cAccent 12 8 70 20
-    Txt $g $data.Title $fCNb $cText 84 8 ($w - 330) 20
-    # 右上角范围切换
-    $rects = @(); $x = $w - 190
-    foreach ($opt in @(@('1h', '近 1 小时'), @('24h', '近 24 小时'))) {
-        $on = $range -eq $opt[0]
-        $rw = 84
-        if ($on) { $g.FillRectangle($GDI['lv0'], $x, 7, $rw, 20); Txt $g $opt[1] $fCNb $cBg $x 7 $rw 20 $tfC }
-        else { $g.DrawRectangle($GDI['accPen'], $x, 7, $rw, 20); Txt $g $opt[1] $fCN $cAccent $x 7 $rw 20 $tfC }
-        $rects += , @($x, ($x + $rw), $opt[0]); $x += $rw + 6
+    # 右上角范围切换：近 30 分钟 / 1 / 3 / 12 / 24 小时
+    $rw = 64; $gap = 4
+    $x = $w - 24 - $RangeHours.Count * ($rw + $gap) + $gap
+    Txt $g '近' $fCN $cGray ($x - 26) 7 22 20 $tfR
+    Txt $g $data.Title $fCNb $cText 84 8 ($x - 84 - 34) 20
+    $rects = @()
+    foreach ($key in $RangeHours.Keys) {
+        if ($range -eq $key) { $g.FillRectangle($GDI['lv0'], $x, 7, $rw, 20); Txt $g $RangeLabel[$key] $fCNb $cBg $x 7 $rw 20 $tfC }
+        else { $g.DrawRectangle($GDI['accPen'], $x, 7, $rw, 20); Txt $g $RangeLabel[$key] $fCN $cAccent $x 7 $rw 20 $tfC }
+        $rects += , @($x, ($x + $rw), $key); $x += $rw + $gap
     }
     $script:rangeRects = $rects
-    $lines = @($data.Lines | Where-Object { $_ })
+    $end = [DateTime]::UtcNow.Ticks
+    $spanT = [long]([TimeSpan]::FromHours($RangeHours[$range]).Ticks)
+    $begin = $end - $spanT
+    # 只留在这段时间里至少有 2 个点的线
+    $lines = @(foreach ($ln in $data.Lines) {
+        if (-not $ln) { continue }
+        $n = 0; foreach ($tk in $ln.T) { if ($tk -ge $begin) { $n++ } }
+        if ($n -ge 2) { $ln }
+    })
     $L = 70; $R = 24; $T = 36; $B = 42
     $pw = $w - $L - $R; $ph = $h - $T - $B
     Txt $g $data.Note $fCN $cGray 14 ($h - 22) ($w - 28) 16
     if (-not $lines) {
-        $msg = if ($script:chartMode -eq 'proc' -and -not $script:selected) { $data.Note } elseif ($range -eq '1h') { '实时数据还不够：窗口每 5 秒记录一个点，稍等片刻；或者切到"近 24 小时"看看门狗的记录。' } else { '还没有 24 小时记录：看门狗每 10 分钟记录一次。可以先看"近 1 小时"的实时数据。' }
+        $msg = if ($script:chartMode -eq 'proc' -and -not $script:selected) { $data.Note }
+            elseif ($RangeHours[$range] -le 1) { '实时数据还不够：窗口每 5 秒记录一个点，稍等片刻；或者选"3 小时"以上，看看门狗的记录。' }
+            else { '这段时间还没有看门狗的记录（每 10 分钟记录一次）。可以先看"30 分钟 / 1 小时"的实时数据，或者选更长的时间。' }
         Txt $g $msg $fCN $cGray 14 44 ($w - 28) 40 $tfW
         return
     }
-    $end = [DateTime]::UtcNow.Ticks
-    $spanT = if ($range -eq '24h') { [TimeSpan]::FromHours(24).Ticks } else { [TimeSpan]::FromHours(1).Ticks }
-    $begin = $end - $spanT
     $max = 0.0; $min = [double]::MaxValue
     foreach ($ln in $lines) { for ($i = 0; $i -lt $ln.V.Length; $i++) { if ($ln.T[$i] -lt $begin) { continue }; $v = $ln.V[$i]; if ($v -gt $max) { $max = $v }; if ($v -lt $min) { $min = $v } } }
     if ($min -eq [double]::MaxValue) { $min = 0 }
     if ($data.FixedMax) { $lo = 0; $hi = $data.FixedMax }
     else { $pad = [math]::Max(($max - $min) * 0.15, [math]::Max($max * 0.02, 0.5)); $lo = [math]::Max(0, $min - $pad); $hi = $max + $pad }
-    $fmt = if ($hi -lt 10) { '{0:N1}' } else { '{0:N0}' }
+    $fmt = if ($hi - $lo -lt 10) { '{0:N1}' } else { '{0:N0}' }   # 范围小时多显示一位小数，免得刻度重复
     for ($i = 0; $i -le 3; $i++) {
         $y = $T + $ph * $i / 3
         $g.DrawLine($GDI['grid'], $L, $y, $L + $pw, $y)
         Txt $g (($fmt -f ($hi - ($hi - $lo) * $i / 3)) + ' ' + $data.Unit) $fSmall $cGray 4 ($y - 9) ($L - 10) 18 $tfR
     }
-    $ticks = if ($range -eq '24h') { 4 } else { 4 }
+    $ticks = if ($range -eq '3h' -or $range -eq '12h') { 6 } else { 4 }
     for ($k = 0; $k -le $ticks; $k++) {
         $x = $L + $pw * $k / $ticks
         $g.DrawLine($GDI['grid'], $x, $T, $x, $T + $ph)
@@ -1409,9 +1421,10 @@ function Refresh-All {
         'io'  { @($list | Sort-Object IoMBs -Descending) }
         default { @($list | Sort-Object @{ Expression = { $ratings[$_.Name].Score + $(if ($_.IoMBs -ge $HeavyIoMBs) { 40 } else { 0 }) }; Descending = $true }, @{ Expression = 'PrivMB'; Descending = $true }) }
     }
-    # 原地更新列表（不清空重建）：只改变了的格子，滚动位置和选中都保留，不闪
+    # 原地更新列表（不清空重建）：只改变了的格子，滚动位置和选中都保留。
+    # 不用 BeginUpdate/EndUpdate：EndUpdate 会把整张列表擦掉重画，看起来像消失了一下再出现；
+    # 逐格修改只重画变了的行，而且要等这次刷新结束后才一起画，不会闪
     $script:updating = $true
-    $lv.BeginUpdate()
     try {
         while ($lv.Items.Count -gt $list.Count) { $lv.Items.RemoveAt($lv.Items.Count - 1) }
         for ($i = 0; $i -lt $list.Count; $i++) {
@@ -1424,7 +1437,7 @@ function Refresh-All {
             $sel = $r.Name -eq $script:selected
             if ($it.Selected -ne $sel) { $it.Selected = $sel }
         }
-    } finally { $lv.EndUpdate(); $script:updating = $false }
+    } finally { $script:updating = $false }
     Fit-Columns
     Update-DetailButtons
     $nIg = @(Active-Ignores).Count; Set-Text $btnIgnored $(if ($nIg) { "已忽略的问题（$nIg）" } else { '已忽略的问题' })
