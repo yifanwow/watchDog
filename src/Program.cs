@@ -74,6 +74,29 @@ namespace WatchDog
             return 0;
         }
 
+        // 截图：用 PrintWindow 抓窗口真实的样子（含 Windows 11 的深色标题栏和珊瑚红边框），
+        // 再裁掉窗口四周看不见的拖拽边；失败时退回 DrawToBitmap 的结果（标题栏会是老式的浅色）
+        static void Snapshot(Form form, string file, Bitmap fallback)
+        {
+            Application.DoEvents(); Thread.Sleep(300); Application.DoEvents();
+            Native.RECT wr, fr;
+            Native.GetWindowRect(form.Handle, out wr);
+            if (Native.DwmGetWindowAttribute(form.Handle, 9, out fr, 16) != 0) fr = wr;   // DWMWA_EXTENDED_FRAME_BOUNDS
+            using (Bitmap full = new Bitmap(wr.R - wr.L, wr.B - wr.T))
+            {
+                bool ok;
+                using (Graphics g = Graphics.FromImage(full))
+                {
+                    IntPtr hdc = g.GetHdc();
+                    ok = Native.PrintWindow(form.Handle, hdc, 2);   // PW_RENDERFULLCONTENT
+                    g.ReleaseHdc(hdc);
+                }
+                if (!ok) { fallback.Save(file, System.Drawing.Imaging.ImageFormat.Png); return; }
+                Rectangle crop = new Rectangle(fr.L - wr.L, fr.T - wr.T, fr.R - fr.L, fr.B - fr.T);
+                using (Bitmap c = full.Clone(crop, full.PixelFormat)) c.Save(file, System.Drawing.Imaging.ImageFormat.Png);
+            }
+        }
+
         static Dictionary<string, string> ParseArgs(string[] argv)
         {
             Dictionary<string, string> d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -120,7 +143,7 @@ namespace WatchDog
                                     Native.GetGuiResources(me.Handle, 0), Native.GetGuiResources(me.Handle, 1), form.IconCount, form.SeriesCount));
                         }
                     }
-                    if (snapshot != null) bmp.Save(snapshot, System.Drawing.Imaging.ImageFormat.Png);
+                    if (snapshot != null) Snapshot(form, snapshot, bmp);
                     form.Report(outp);
                     outp.AppendLine("--- 自身资源 ---");
                     foreach (string s in mem) outp.AppendLine(s);
