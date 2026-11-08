@@ -9,7 +9,12 @@ using System.Windows.Forms;
 
 namespace WatchDog
 {
-    class CardData { public string Code, Tag, Title, Mode, Value = "--", Badge = "...", Sub = ""; public int Level = -1; public double Pct = -1; }
+    class CardData
+    {
+        public string Code, Tag, Title, Mode, Value = "--", Badge = "...", Sub = "", Extra = "";
+        public int Level = -1; public double Pct = -1;
+        public List<KeyValuePair<string, double>> Top = new List<KeyValuePair<string, double>>();   // 内存卡片右侧：占用最多的程序
+    }
     class Line { public long[] T; public double[] V; public int Level; public string Name; public PointF? LastPt; }
     class ChartData { public string Title = "", Unit = "", Note = ""; public double FixedMax; public List<Line> Lines = new List<Line>(); }
 
@@ -23,9 +28,10 @@ namespace WatchDog
         static Color LevelColor(int l) { return l == 0 ? cCyan : l == 1 ? cYellow : l == 2 ? cRed : cGray; }
         static int Lx(int l) { return l == -1 ? 3 : Math.Max(0, Math.Min(2, l)); }   // 等级 -> 数组下标
 
-        Font fCN, fCNb, fCNbig, fTagB, fNum, fNumCN, fHead, fSmall;
-        SolidBrush bBg, bPanel, bRowA, bRowB, bDim, bSel, bRow2, bRow1, bDimLine, bAcc;
-        Pen pAcc, pAccDim, pCyan, pScan, pGrid;
+        Font fCN, fCNb, fCNbig, fTagB, fNum, fNumBig, fNumS, fHead, fSmall, fMono;
+        SolidBrush bBg, bPanel, bRowA, bRowB, bDim, bSel, bRow2, bRow1, bDimLine, bAcc, bDeep, bCyanDim, bRed;
+        Brush bHaz;
+        Pen pAcc, pAccDim, pCyan, pScan, pGrid, pCyanThin, pCyanDash, pPulse, pPulseGlow;
         SolidBrush[] bLv = new SolidBrush[4], bFill = new SolidBrush[4];
         Pen[] pGlow = new Pen[4], pCore = new Pen[4];
         List<IDisposable> gdi = new List<IDisposable>();
@@ -41,9 +47,12 @@ namespace WatchDog
         {
             fCN = Keep(new Font("Microsoft YaHei UI", 9)); fCNb = Keep(new Font("Microsoft YaHei UI", 9, FontStyle.Bold));
             fCNbig = Keep(new Font("Microsoft YaHei UI", 12, FontStyle.Bold)); fTagB = Keep(new Font("Bahnschrift SemiBold SemiConden", 10));
-            fNum = Keep(new Font("Bahnschrift SemiBold", 20));
-            fNumCN = Keep(new Font("Microsoft YaHei UI", 16, FontStyle.Bold));   // 数值里有中文时用它，Bahnschrift 没有中文字形
-            fHead = Keep(new Font("Bahnschrift SemiBold", 18)); fSmall = Keep(new Font("Bahnschrift", 8.5f));
+            fNum = Keep(new Font("Bahnschrift SemiBold", 20)); fNumBig = Keep(new Font("Bahnschrift SemiBold", 26)); fNumS = Keep(new Font("Bahnschrift SemiBold", 17));
+            fHead = Keep(new Font("Bahnschrift SemiBold", 18)); fSmall = Keep(new Font("Bahnschrift", 8.5f)); fMono = Keep(new Font("Consolas", 8.5f));
+            bDeep = Keep(new SolidBrush(Color.FromArgb(9, 6, 8))); bCyanDim = Keep(new SolidBrush(Color.FromArgb(38, 94, 246, 255))); bRed = Keep(new SolidBrush(cRed));
+            bHaz = Keep(new HatchBrush(HatchStyle.WideUpwardDiagonal, cYellow, cBg));   // 黄黑警示条
+            pCyanThin = Keep(new Pen(cCyan, 1)); pCyanDash = Keep(new Pen(Color.FromArgb(110, 94, 246, 255), 1)); pCyanDash.DashStyle = DashStyle.Dash;
+            pPulse = Keep(new Pen(cCyan, 1.5f)); pPulseGlow = Keep(new Pen(Color.FromArgb(60, 94, 246, 255), 5)); pPulseGlow.LineJoin = LineJoin.Round;
             bBg = Keep(new SolidBrush(cBg)); bPanel = Keep(new SolidBrush(cPanel)); bRowA = Keep(new SolidBrush(cRowA)); bRowB = Keep(new SolidBrush(cRowB));
             bDim = Keep(new SolidBrush(cDim)); bSel = Keep(new SolidBrush(Color.FromArgb(12, 46, 54))); bRow2 = Keep(new SolidBrush(Color.FromArgb(78, 14, 22)));
             bRow1 = Keep(new SolidBrush(Color.FromArgb(48, 40, 8))); bDimLine = Keep(new SolidBrush(cRedDim)); bAcc = Keep(new SolidBrush(cAccent));
@@ -82,6 +91,7 @@ namespace WatchDog
             Scanlines(g, w, h);
             g.DrawPolygon(active ? pCyan : pAcc, poly);
             g.FillRectangle(active ? bLv[0] : bAcc, 0, 0, 46, 4);
+            Deco(g, w, h);
             if (tag != null)
             {
                 Txt(g, "// " + tag, fTagB, cAccent, 12, 8, 160, 22);
@@ -89,14 +99,31 @@ namespace WatchDog
             }
         }
 
+        // 赛博朋克小装饰：左侧导轨、右下角荧光蓝角标、底边刻度
+        void Deco(Graphics g, int w, int h)
+        {
+            g.FillRectangle(bAcc, 3, 34, 2, 22);
+            g.FillRectangle(bDimLine, 3, 60, 2, 6); g.FillRectangle(bDimLine, 3, 70, 2, 3);
+            g.DrawLine(pCyanThin, w - 7, h - 18, w - 7, h - 7); g.DrawLine(pCyanThin, w - 7, h - 7, w - 18, h - 7);
+            for (int i = 0; i < 4; i++) g.FillRectangle(bDimLine, 18 + i * 7, h - 6, 4, 2);
+        }
+        // 平行四边形标签（徽章）
+        void Badge(Graphics g, string text, int li, int x, int y, int w, int h)
+        {
+            g.FillPolygon(bLv[li], new[] { new PointF(x + 8, y), new PointF(x + w, y), new PointF(x + w - 8, y + h), new PointF(x, y + h) });
+            Txt(g, text, fCNb, cBg, x, y, w, h, tfC);
+        }
+
         // ---------- 控件 ----------
         BufferedPanel header, cards, diag, detail, actions, chart, status;
-        BufferedPanel cardMem, cardCpu, cardDisk, cardDog;
+        BufferedPanel cardMem, cardCpu, cardDisk;
         BufferedPanel[] cardList;
+        CardData dog = new CardData { Tag = "WATCHDOG", Title = "看门狗", Mode = "dog" };   // 画在体检结论的上半部分
+        const int DogY = 34, DogH = 88;
         BufferedListView lv;
         ImageList rowH;
         ContextMenuStrip menu, trayMenu;
-        ToolStripMenuItem menuFix, menuWatch, menuWatchA, menuUnwatch, menuSnooze, menuNormal, menuRestore;
+        ToolStripMenuItem menuFix, menuWatch, menuWatchA, menuUnwatch, menuSnooze, menuNormal, menuRestore, menuNote;
         Button btnPrimary, btnKill, btnOpen, btnInstall, btnIgnored;
         NotifyIcon tray;
         Timer timer, showTimer;
@@ -127,34 +154,35 @@ namespace WatchDog
             header = new BufferedPanel(); header.Dock = DockStyle.Top; header.Height = 50;
             header.Paint += PaintHeader;
 
-            // 四张卡片（点击切换下方走势图）
-            cards = new BufferedPanel(); cards.Dock = DockStyle.Top; cards.Height = 146; cards.BackColor = cBg;
+            // 三张卡片（点击切换下方走势图）：内存占一半宽，CPU、磁盘各四分之一
+            cards = new BufferedPanel(); cards.Dock = DockStyle.Top; cards.Height = 136; cards.BackColor = cBg;
             cardMem = NewCard("MEMORY", "内存", "MEM-01 // 0x4D45", "mem");
             cardCpu = NewCard("CPU", "处理器", "CPU-02 // 0x4350", "cpu");
-            cardDisk = NewCard("DISK", "磁盘读写", "DSK-03 // 0x4453", "disk");
-            cardDog = NewCard("WATCHDOG", "看门狗 · 自身占用", "WDG-04 // 0x5744", "dog");
-            cardList = new[] { cardMem, cardCpu, cardDisk, cardDog };
+            cardDisk = NewCard("DISK", "磁盘", "DSK-03 // 0x4453", "disk");
+            cardList = new[] { cardMem, cardCpu, cardDisk };
             cards.Resize += delegate
             {
-                int w = (cards.ClientSize.Width - 60) / 4;
-                for (int i = 0; i < 4; i++) cardList[i].SetBounds(12 + i * (w + 12), 6, w, 134);
+                int all = cards.ClientSize.Width - 24, wm = all / 2, ws = (all - wm) / 2;
+                cardMem.SetBounds(0, 0, wm, 136);
+                cardCpu.SetBounds(wm + 12, 0, ws, 136);
+                cardDisk.SetBounds(wm + 24 + ws, 0, cards.ClientSize.Width - (wm + 24 + ws), 136);
             };
 
-            // 右侧栏：体检结论 / 选中程序 / 操作
+            // 右侧栏（从标题条一直到底）：体检结论（含看门狗，占剩下的高度）/ 选中程序 / 操作。都是固定布局，不会出现滚动条
             Panel side = new Panel(); side.Dock = DockStyle.Right; side.Width = 372; side.BackColor = cBg; side.Padding = new Padding(0, 0, 12, 0);
-            diag = new BufferedPanel(); diag.Dock = DockStyle.Top; diag.Height = 216; diag.Cursor = Cursors.Hand;
+            diag = new BufferedPanel(); diag.Dock = DockStyle.Fill; diag.Cursor = Cursors.Hand;
             diag.Paint += PaintDiag; diag.MouseClick += DiagClick;
-            detail = new BufferedPanel(); detail.Dock = DockStyle.Top; detail.Height = 276;
+            detail = new BufferedPanel(); detail.Dock = DockStyle.Bottom; detail.Height = 262;
             detail.Paint += PaintDetail;
-            actions = new BufferedPanel(); actions.Dock = DockStyle.Fill; actions.AutoScroll = true;
+            actions = new BufferedPanel(); actions.Dock = DockStyle.Bottom; actions.Height = 178;
             actions.Paint += delegate(object s, PaintEventArgs e) { Frame(e.Graphics, actions.Width, actions.Height, "ACTIONS", "操作", false); };
-            side.Controls.Add(actions);
-            side.Controls.Add(Spacer(10));
-            side.Controls.Add(detail);
-            side.Controls.Add(Spacer(10));
             side.Controls.Add(diag);
+            side.Controls.Add(Spacer(10, DockStyle.Bottom));
+            side.Controls.Add(detail);
+            side.Controls.Add(Spacer(10, DockStyle.Bottom));
+            side.Controls.Add(actions);
 
-            // 主区域：走势图 + 程序列表
+            // 主区域：卡片 + 走势图 + 程序列表
             Panel main = new Panel(); main.Dock = DockStyle.Fill; main.BackColor = cBg; main.Padding = new Padding(12, 0, 12, 0);
             BuildList();
             chart = new BufferedPanel(); chart.Dock = DockStyle.Top; chart.Height = 210;   // 走势图在列表上方
@@ -162,6 +190,8 @@ namespace WatchDog
             main.Controls.Add(lv);
             main.Controls.Add(Spacer(8));
             main.Controls.Add(chart);
+            main.Controls.Add(Spacer(10));
+            main.Controls.Add(cards);
             lv.BringToFront();
 
             // 底部状态栏
@@ -170,8 +200,7 @@ namespace WatchDog
 
             Controls.Add(main);
             Controls.Add(side);
-            Controls.Add(Spacer(6));
-            Controls.Add(cards);
+            Controls.Add(Spacer(8));
             Controls.Add(header);
             Controls.Add(status);
             main.BringToFront();
@@ -189,30 +218,42 @@ namespace WatchDog
             };
         }
 
-        Panel Spacer(int h) { Panel p = new Panel(); p.Dock = DockStyle.Top; p.Height = h; p.BackColor = cBg; return p; }
+        Panel Spacer(int h, DockStyle dock = DockStyle.Top) { Panel p = new Panel(); p.Dock = dock; p.Height = h; p.BackColor = cBg; return p; }
 
         // ---------- 标题条 ----------
         void PaintHeader(object s, PaintEventArgs e)
         {
             Graphics g = e.Graphics; int w = header.Width, h = header.Height;
             g.FillRectangle(bBg, 0, 0, w, h);
+            Scanlines(g, w, h);
+            // 标题：红色错位的"故障"重影 + 荧光蓝本体
+            if (tick % 6 == 3) Txt(g, "WATCHDOG", fHead, cRed, 19, 8, 200, 34);
+            else Txt(g, "WATCHDOG", fHead, cRedDim, 18, 7, 200, 34);
             Txt(g, "WATCHDOG", fHead, cCyan, 16, 6, 200, 34);
             Txt(g, "// Which dream is your want", fTagB, cAccent, 152, 6, 260, 34);
-            // 自身占用：看门狗（最近一次后台检查）+ 本窗口
-            SysRow last = sys.Count > 0 ? sys[sys.Count - 1] : null;
-            string dogTxt = last == null ? "看门狗 未运行"
-                : last.HasSelf ? string.Format("看门狗 每 10 分钟运行 {0:N1} 秒 · CPU {1:N1} 秒 · 峰值 {2:N0} MB，用完即退出", last.RunMs / 1000, last.SelfCpuSec, last.SelfPeakMB)
-                : string.Format("看门狗 每 10 分钟运行 {0:N1} 秒，用完即退出", last.RunMs / 1000);
-            string selfTxt = string.Format("本窗口 {0:N0} MB · CPU {1:N1}%", selfMB, selfCpu);
-            int rx = w - 262, rw = Math.Max(200, rx - 420);
-            Txt(g, dogTxt, fCN, cGray, rx - rw, 6, rw, 18, tfR);
-            Txt(g, selfTxt, fCN, cCyan, rx - rw, 24, rw, 18, tfR);
+            // 条形码 + 信号格（条形码每次刷新变一点，像在传数据）
+            int bx = 420; uint seed = (uint)(tick * 2654435761u);
+            for (int i = 0; i < 26; i++)
+            {
+                seed = seed * 1103515245u + 12345u; int bw = 1 + (int)((seed >> 16) % 3);
+                if (bx + bw > 520) break;
+                g.FillRectangle(i % 5 == 0 ? bAcc : bDimLine, bx, 12, bw, 24); bx += bw + 2;
+            }
+            Txt(g, string.Format("0x{0:X4}", (seed >> 8) & 0xFFFF), fMono, cRedDim, 420, 36, 100, 12);
+            int[] sig = { 6, 10, 14, 18, 22 };
+            int lit = 3 + tick % 3;
+            for (int i = 0; i < sig.Length; i++) g.FillRectangle(i < lit ? bLv[0] : bDim, 534 + i * 7, 36 - sig[i], 4, sig[i]);
+            string selfTxt = string.Format("本窗口 {0:N0} MB · CPU {1:N1}% · GDI {2}", selfMB, selfCpu, selfGdi);
+            int rx = w - 262, rw = Math.Max(120, rx - 590);
+            Txt(g, "SELF // 自身占用", fSmall, cRedDim, rx - rw, 6, rw - 4, 16, tfR);
+            Txt(g, selfTxt, fCN, cCyan, rx - rw, 22, rw - 4, 18, tfR);
             g.FillRectangle(bDimLine, rx + 4, 12, 1, 26);
             g.FillRectangle(tick % 2 == 0 ? bLv[2] : bPanel, w - 250, 17, 8, 8);
             Txt(g, "LIVE  " + DateTime.Now.ToString("HH:mm"), fTagB, cCyan, w - 234, 6, 90, 28);
-            Txt(g, "SYS.MON v7 // 0x5744", fSmall, cRedDim, w - 200, 6, 186, 28, tfR);
+            Txt(g, "SYS.MON v8 // 0x5744", fSmall, cRedDim, w - 200, 6, 186, 28, tfR);
             g.FillRectangle(bAcc, 0, h - 3, w, 1);
             g.FillPolygon(bAcc, new[] { new PointF(0, h - 6), new PointF(220, h - 6), new PointF(226, h - 2), new PointF(0, h - 2) });
+            g.FillRectangle(bHaz, w - 140, h - 7, 128, 4);
         }
 
         // ---------- 卡片 ----------
@@ -233,34 +274,63 @@ namespace WatchDog
             bool active = chartMode == d.Mode;
             Frame(g, w, h, d.Tag, d.Title, active);
             int li = Lx(d.Level);
+            bool big = d.Mode == "mem";
             Txt(g, active ? "▼ 走势显示中" : d.Code, fSmall, active ? cCyan : cRedDim, w - 160, h - 17, 148, 14, tfR);
-            if (!string.IsNullOrEmpty(d.Badge))
-            {
-                int bx = w - 118, by = 10;
-                g.FillPolygon(bLv[li], new[] { new PointF(bx + 8, by), new PointF(bx + 104, by), new PointF(bx + 96, by + 22), new PointF(bx, by + 22) });
-                Txt(g, d.Badge, fCNb, cBg, bx, by, 104, 22, tfC);
-            }
-            Font vf = d.Value.Any(c => c > 0x7F) ? fNumCN : fNum;
-            Txt(g, d.Value, vf, cCyan, 10, 34, w - 20, 36);
+            if (!string.IsNullOrEmpty(d.Badge)) { int bwid = big ? 104 : 84; Badge(g, d.Badge, li, w - bwid - 14, 10, bwid, 22); }
+            // 大卡片（内存）：左边数值 + 进度条，右边"占用最多"
+            int lw = big ? (int)(w * 0.54) : w;
+            Txt(g, d.Value, big ? fNumBig : fNumS, cCyan, 10, big ? 30 : 36, lw - 20, big ? 44 : 32);
             if (d.Pct >= 0)
             {
-                int n = 24; float gap = 3, bw = (w - 24 - gap * (n - 1)) / n;
+                int n = big ? 30 : 16; float gap = 3, bw = (lw - 24 - gap * (n - 1)) / n;
                 int on = (int)Math.Round(n * Math.Min(100, d.Pct) / 100);
                 for (int i = 0; i < n; i++) g.FillRectangle(i < on ? bLv[li] : bDim, 12 + i * (bw + gap), 76, bw, 8);
             }
-            Txt(g, d.Sub, fCN, cGray, 12, 90, w - 24, 20);
+            Txt(g, d.Sub, fCN, cGray, 12, 90, lw - 24, 20);
+            if (big && d.Extra.Length > 0) Txt(g, d.Extra, fCN, cGray, 12, 108, lw - 24, 18);
+            if (big && d.Top.Count > 0)
+            {
+                int x0 = lw + 4, tw = w - x0 - 16;
+                g.FillRectangle(bDimLine, lw - 6, 40, 1, 72);
+                Txt(g, "TOP // 占用最多", fSmall, cAccent, x0, 38, tw, 14);
+                double max = Math.Max(1, d.Top.Max(t => t.Value));
+                for (int i = 0; i < d.Top.Count && i < 3; i++)
+                {
+                    int y = 56 + i * 20;
+                    g.FillRectangle(bCyanDim, x0, y + 2, (float)(tw * d.Top[i].Value / max), 15);
+                    g.FillRectangle(bLv[0], x0, y + 2, 2, 15);
+                    Txt(g, d.Top[i].Key, fCNb, cText, x0 + 8, y, tw - 80, 19);
+                    Txt(g, string.Format("{0:N0} MB", d.Top[i].Value), fTagB, cCyan, x0 + tw - 84, y, 80, 19, tfR);
+                }
+            }
+        }
+        // 只在内容真的变了时重绘
+        static bool SetData(CardData d, string value, string badge, int level, string sub, double pct)
+        {
+            if (d.Value == value && d.Badge == badge && d.Level == level && d.Sub == sub && (int)d.Pct == (int)pct) return false;
+            d.Value = value; d.Badge = badge; d.Level = level; d.Sub = sub; d.Pct = pct;
+            return true;
         }
         void SetCard(BufferedPanel card, string value, string badge, int level, string sub, double pct)
         {
-            CardData d = (CardData)card.Tag;
-            if (d.Value == value && d.Badge == badge && d.Level == level && d.Sub == sub && (int)d.Pct == (int)pct) return;
-            d.Value = value; d.Badge = badge; d.Level = level; d.Sub = sub; d.Pct = pct;
-            card.Invalidate();
+            if (SetData((CardData)card.Tag, value, badge, level, sub, pct)) card.Invalidate();
+        }
+        void SetMemExtra(string extra, List<KeyValuePair<string, double>> top)
+        {
+            CardData d = (CardData)cardMem.Tag;
+            string a = string.Join("|", d.Top.Select(t => t.Key + ((int)t.Value))), b = string.Join("|", top.Select(t => t.Key + ((int)t.Value)));
+            if (a == b && d.Extra == extra) return;
+            d.Top = top; d.Extra = extra; cardMem.Invalidate();
+        }
+        void SetDog(string value, string badge, int level, string sub, double pct)
+        {
+            if (SetData(dog, value, badge, level, sub, pct)) diag.Invalidate(new Rectangle(0, DogY, diag.Width, DogH));
         }
         void SetChartMode(string mode)
         {
             chartMode = mode;   // 时间范围保持用户上次选的
             foreach (BufferedPanel c in cardList) c.Invalidate();
+            diag.Invalidate(new Rectangle(0, DogY, diag.Width, DogH));
             chart.Invalidate();
         }
 
@@ -268,10 +338,12 @@ namespace WatchDog
         void PaintDiag(object s, PaintEventArgs e)
         {
             Graphics g = e.Graphics; int w = diag.Width, h = diag.Height;
-            Frame(g, w, h, "DIAGNOSIS", "体检结论", false);
-            Txt(g, verdict[0], fCNbig, LevelColor(int.Parse(verdict[1])), 14, 32, w - 28, 24);
-            Txt(g, verdict[2], fCN, cGray, 14, 56, w - 28, 18);
-            int y = 80; List<object[]> rects = new List<object[]>();
+            Frame(g, w, h, "DIAGNOSIS", "体检结论 · 看门狗", false);
+            PaintDog(g, 12, DogY, w - 26, DogH);
+            int vy = DogY + DogH + 8;
+            Txt(g, verdict[0], fCNbig, LevelColor(int.Parse(verdict[1])), 14, vy, w - 28, 24);
+            Txt(g, verdict[2], fCN, cGray, 14, vy + 24, w - 28, 18);
+            int y = vy + 48; List<object[]> rects = new List<object[]>();
             foreach (Issue it in issues)
             {
                 if (y + 36 > h - 6) { Txt(g, "…还有更多，见左侧列表（按\"稳定性\"排在最前）", fCN, cGray, 30, y, w - 44, 18); break; }
@@ -292,9 +364,69 @@ namespace WatchDog
                 y += 38;
             }
             issueRects = rects;
+            // 剩下的空间：看门狗最近几次检查的记录（终端风格）
+            y += 6;
+            if (sys.Count > 0 && y + 40 < h - 10)
+            {
+                g.FillRectangle(bDimLine, 14, y, w - 28, 1);
+                Txt(g, "// LOG 最近的后台检查", fSmall, cAccent, 14, y + 4, w - 28, 14);
+                y += 22;
+                for (int i = sys.Count - 1; i >= 0 && y + 16 < h - 10; i--, y += 17)
+                {
+                    SysRow r = sys[i];
+                    Txt(g, r.T.ToString("MM-dd HH:mm"), fMono, cRedDim, 16, y, 84, 16);
+                    Txt(g, string.Format("巡检 {0:N1}s · 内存 {1:N1} GB · CPU {2:N0}%", r.RunMs / 1000, r.UsedMB / 1024, r.CpuPct), fCN, i == sys.Count - 1 ? cText : cGray, 102, y, w - 116, 16);
+                }
+            }
+        }
+        // 看门狗：终端风格的小面板。左边黄黑警示条，中间是"心跳"——最近 90 分钟每次后台检查是一个脉冲（越高 = 那次跑得越久）
+        void PaintDog(Graphics g, int x, int y, int w, int h)
+        {
+            bool active = chartMode == "dog";
+            g.FillRectangle(bDeep, x, y, w, h);
+            g.FillRectangle(bHaz, x, y, 7, h);
+            g.DrawRectangle(active ? pCyanThin : pAccDim, x, y, w - 1, h - 1);
+            int cx = x + 14, li = Lx(dog.Level);
+            Txt(g, "> WDG-04", fMono, cYellow, cx, y + 5, 64, 16);
+            Txt(g, "看门狗 · 后台巡检", fCN, cGray, cx + 62, y + 4, w - 170, 18);
+            Badge(g, dog.Badge, li, x + w - 84, y + 4, 76, 18);
+            Txt(g, dog.Value, fCNbig, LevelColor(dog.Level), cx, y + 24, 140, 26);
+            // 心跳线
+            int px = cx + 146, pw = x + w - 10 - px, base0 = y + 44, amp = 16;
+            g.DrawLine(pGrid, px, base0, px + pw, base0);
+            DateTime now = DateTime.Now, from = now.AddMinutes(-90);
+            List<SysRow> runs = sys.Where(r => r.T >= from).ToList();
+            if (runs.Count > 0)
+            {
+                double maxMs = Math.Max(1, runs.Max(r => r.RunMs));
+                List<PointF> pts = new List<PointF>(); pts.Add(new PointF(px, base0));
+                foreach (SysRow r in runs)
+                {
+                    float rx = px + (float)(pw * (r.T - from).TotalMinutes / 90.0), a = amp * (float)(0.35 + 0.65 * r.RunMs / maxMs);
+                    if (rx - 4 < pts[pts.Count - 1].X) continue;
+                    pts.Add(new PointF(rx - 4, base0)); pts.Add(new PointF(rx - 1.5f, base0 - a)); pts.Add(new PointF(rx + 1.5f, base0 + a * 0.4f)); pts.Add(new PointF(rx + 4, base0));
+                }
+                pts.Add(new PointF(px + pw, base0));
+                PointF[] arr = pts.ToArray();
+                g.DrawLines(pPulseGlow, arr); g.DrawLines(pPulse, arr);
+                float lx = px + (float)(pw * (runs[runs.Count - 1].T - from).TotalMinutes / 90.0);
+                g.FillEllipse(tick % 2 == 0 ? bLv[0] : bCyanDim, lx - 3, base0 - 3, 6, 6);
+            }
+            Txt(g, "-90m", fMono, cRedDim, px, y + 46, 34, 12);
+            Txt(g, "now", fMono, cRedDim, px + pw - 30, y + 46, 30, 12, tfR);
+            // 距离下次检查的进度
+            if (dog.Pct >= 0)
+            {
+                int n = 30; float gap = 2, bw = (w - 24 - gap * (n - 1)) / n;
+                int on = (int)Math.Round(n * Math.Min(100, dog.Pct) / 100);
+                for (int i = 0; i < n; i++) g.FillRectangle(i < on ? bLv[li] : bDim, cx + i * (bw + gap), y + 60, bw, 4);
+            }
+            Txt(g, dog.Sub, fCN, cGray, cx, y + 67, w - 24 - (active ? 76 : 0), 18);
+            if (active) Txt(g, "▼ 走势显示中", fSmall, cCyan, x + w - 84, y + 69, 76, 14, tfR);
         }
         void DiagClick(object s, MouseEventArgs e)
         {
+            if (e.Y >= DogY && e.Y < DogY + DogH) { SetChartMode("dog"); return; }
             foreach (object[] r in issueRects)
             {
                 int y0 = (int)r[0], y1 = (int)r[1]; string key = (string)r[3], title = (string)r[4];
@@ -326,7 +458,7 @@ namespace WatchDog
             if (icon != null) { g.InterpolationMode = InterpolationMode.HighQualityBicubic; g.DrawImage(icon, 14, 38, 32, 32); }
             else { g.FillRectangle(bDim, 14, 38, 32, 32); g.DrawRectangle(pAcc, 14, 38, 32, 32); }
             Txt(g, name, fCNbig, cCyan, 56, 36, w - 70, 22);
-            string sub; if (!Desc.TryGetValue(name, out sub)) sub = "-";
+            string sub = (HasNote(name) ? "✎ " : "") + (DescOf(name) ?? "-");
             Rule wr;
             if (watched.TryGetValue(name, out wr)) sub += string.Format("  ·  ◉ 看门狗监控中（超过 {0} MB {1}）", wr.MinMB, wr.Auto ? "自动重启" : "提醒");
             Txt(g, sub, fCN, cGray, 56, 58, w - 70, 18);
@@ -369,11 +501,13 @@ namespace WatchDog
             lv.ColumnClick += delegate(object s, ColumnClickEventArgs e)
             {
                 sortMode = e.Column == 2 ? "mem" : e.Column == 3 ? "cpu" : e.Column == 4 ? "io" : "issue";
-                lv.Invalidate(); RefreshAll();
+                RefreshAll(); lv.Invalidate();
             };
             lv.DrawItem += delegate { };
             lv.DrawSubItem += DrawSubItem;
             lv.Resize += delegate { FitColumns(); };
+            // 自绘 + 整行选中时，Windows 只重画第一列；选中变化时手动重画整行，否则旧高亮会留到鼠标划过才消失
+            lv.ItemSelectionChanged += delegate(object s, ListViewItemSelectionChangedEventArgs e) { lv.Invalidate(e.Item.Bounds); };
             lv.SelectedIndexChanged += delegate
             {
                 if (updating) return;
@@ -405,7 +539,7 @@ namespace WatchDog
                 return;
             }
             double io; double.TryParse(it.SubItems[4].Text, out io);
-            Color c = col == 1 || col == 6 ? cGray : col == 4 ? (io >= HeavyIoMBs ? cYellow : cText) : col == 5 ? LevelColor(lvl) : col == 7 ? (lvl >= 1 ? LevelColor(lvl) : cGray) : cText;
+            Color c = col == 1 ? (HasNote(it.Text) ? cText : cGray) : col == 6 ? cGray : col == 4 ? (io >= HeavyIoMBs ? cYellow : cText) : col == 5 ? LevelColor(lvl) : col == 7 ? (lvl >= 1 ? LevelColor(lvl) : cGray) : cText;
             Txt(g, e.SubItem.Text, col == 5 ? fCNb : fCN, c, r.X + 8, r.Y, r.Width - 16, r.Height, RightCols.Contains(col) ? tfR : tfL);
         }
         void FitColumns()
@@ -463,7 +597,7 @@ namespace WatchDog
                     break;
                 default:
                     if (selected == null) { d.Note = "点选列表里的程序看它的内存走势；点上面的卡片看整机内存 / CPU / 磁盘 / 看门狗"; break; }
-                    string desc; if (!Desc.TryGetValue(selected, out desc)) desc = "-";
+                    string desc = DescOf(selected) ?? "-";
                     d.Title = selected + "  ·  " + desc; d.Unit = "MB"; d.Note = lng ? rec : live;
                     List<HistPt> hl; hist.TryGetValue(selected, out hl);
                     d.Lines.Add(lng ? HistLine(hl, x => x.T, x => x.MB, 0, "内存") : RingLine(selected, 0, "内存"));
@@ -503,7 +637,7 @@ namespace WatchDog
             List<Line> lines = data.Lines.Where(l => l.T.Count(t => t >= begin) >= 2).ToList();
             const int L = 70, R = 24, T = 36, B = 42;
             int pw = w - L - R, ph = h - T - B;
-            Txt(g, data.Note, fCN, cGray, 14, h - 22, w - 28, 16);
+            Txt(g, data.Note, fCN, cGray, 14, h - 22, w - 200, 16);
             if (lines.Count == 0)
             {
                 string msg = chartMode == "proc" && selected == null ? data.Note
@@ -566,7 +700,9 @@ namespace WatchDog
                 string txt = string.Format(fmt, ln.V[ln.V.Length - 1]) + " " + data.Unit;
                 if (lines.Count > 1) { Txt(g, ln.Name + " " + txt, fTagB, LevelColor(ln.Level), L + 8, ly, 160, 18); ly += 18; }
                 else Txt(g, txt, fTagB, LevelColor(ln.Level), lp.X - 130, lp.Y - 26, 124, 20, tfR);
+                g.DrawLine(pCyanDash, lp.X, lp.Y + 6, lp.X, T + ph);   // 末端准星线
             }
+            Txt(g, "TRND-05 // 0x5452", fSmall, cRedDim, w - 180, h - 22, 166, 16, tfR);
         }
         void ChartClick(object s, MouseEventArgs e)
         {
@@ -581,17 +717,17 @@ namespace WatchDog
             Graphics g = e.Graphics; int w = status.Width, h = status.Height;
             g.FillRectangle(bBg, 0, 0, w, h);
             g.DrawLine(pAccDim, 0, 0, w, 0);
-            g.FillRectangle(bAcc, 12, 10, 8, 8);
-            string txt = string.Format("每 5 秒刷新 · 点关闭缩到托盘、后台继续记录 · 本窗口：内存 {0:N0} MB / CPU {1:N2}% / GDI {2} · 实时数据 {3} 条 · 点卡片切换走势图 · 点列标题切换排序 · 右键程序可让看门狗监控它",
+            g.FillRectangle(bHaz, 12, 9, 22, 10);
+            string txt = string.Format("每 5 秒刷新 · 点关闭缩到托盘、后台继续记录 · 本窗口：内存 {0:N0} MB / CPU {1:N2}% / GDI {2} · 实时数据 {3} 条 · 点卡片 / 看门狗切换走势图 · 点列标题切换排序 · 右键程序可写备注、让看门狗监控它",
                 selfMB, selfCpu, selfGdi, series.Count);
-            Txt(g, txt, fCN, cGray, 28, 0, w - 40, h);
+            Txt(g, txt, fCN, cGray, 42, 0, w - 54, h);
         }
 
         // ---------- 按钮 ----------
         Button NewBtn(Control parent, string text, int x, int y, int w, EventHandler onClick, bool primary)
         {
             Button b = new Button();
-            b.Text = text; b.SetBounds(x, y, w, 32);
+            b.Text = text; b.SetBounds(x, y, w, 28);
             b.FlatStyle = FlatStyle.Flat; b.Font = fCNb; b.Cursor = Cursors.Hand;
             b.BackColor = primary ? Color.FromArgb(70, 18, 24) : cPanel;
             b.ForeColor = primary ? cText : cAccent;
@@ -605,11 +741,11 @@ namespace WatchDog
         void BuildButtons()
         {
             // 选中程序的按钮：主按钮的文字随规则变化（命中规则时显示对应的修复方法）
-            btnPrimary = NewBtn(detail, "重启这个程序", 14, 196, 334, delegate { FixSelected(); }, true);
-            btnKill = NewBtn(detail, "结束", 14, 234, 163, delegate { KillTarget(selected); }, false);
-            btnOpen = NewBtn(detail, "打开位置", 185, 234, 163, delegate { OpenLocation(selected); }, false);
+            btnPrimary = NewBtn(detail, "重启这个程序", 14, 194, 334, delegate { FixSelected(); }, true);
+            btnKill = NewBtn(detail, "结束", 14, 226, 163, delegate { KillTarget(selected); }, false);
+            btnOpen = NewBtn(detail, "打开位置", 185, 226, 163, delegate { OpenLocation(selected); }, false);
             // 操作区按钮（两列）
-            int ax = 14, half = 163, full = 334, ay = 36, step = 38;
+            int ax = 14, half = 163, full = 334, ay = 34, step = 34;
             NewBtn(actions, "一键修复全部问题", ax, ay, full, delegate { FixAll(); }, true); ay += step;
             NewBtn(actions, "立即检查一次", ax, ay, half, delegate { RunCheckNow(); }, false);
             NewBtn(actions, "修复 NVIDIA 数据库", ax + half + 8, ay, half, delegate
@@ -644,6 +780,7 @@ namespace WatchDog
             menuFix = MenuItem(menu, "修复 / 重启", delegate { FixSelected(); });
             MenuItem(menu, "结束这个程序", delegate { KillTarget(selected); });
             MenuItem(menu, "打开文件位置", delegate { OpenLocation(selected); });
+            menuNote = MenuItem(menu, "✎ 写备注说明…", delegate { EditNote(selected); });
             menu.Items.Add(new ToolStripSeparator());
             menuWatch = MenuItem(menu, "◉ 用看门狗监控（超过上限时提醒）", delegate { AddWatch(selected, false); });
             menuWatchA = MenuItem(menu, "◉ 用看门狗监控（超过上限时自动重启）", delegate { AddWatch(selected, true); });
@@ -661,6 +798,7 @@ namespace WatchDog
                 string n = selected;
                 if (n == null) { e.Cancel = true; return; }
                 menuFix.Text = btnPrimary.Text;
+                menuNote.Text = HasNote(n) ? "✎ 修改备注说明…" : "✎ 写备注说明…";
                 bool hasIssue = IssueOf(n) != null;
                 menuSnooze.Visible = hasIssue; menuNormal.Visible = hasIssue;
                 menuRestore.Visible = HasIgnore(n);

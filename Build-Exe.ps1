@@ -72,10 +72,17 @@ $src = @(Get-ChildItem (Join-Path $dir 'src') -Filter '*.cs' | ForEach-Object { 
 if (-not $src) { Write-Host 'src\*.cs not found'; exit 1 }
 # The monitor may be running (it hides in the tray): close it first, the exe file is locked while it runs
 $running = @(Get-Process WatchDog -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe })
-if ($running) { Write-Host 'WatchDog is running - exit it from the tray icon first (right-click -> 退出).'; exit 1 }
+$wasRunning = $running.Count -gt 0
+if ($wasRunning) {
+    # Ask it to save its live data and exit (WatchDog.exe --exit), then wait for it
+    Start-Process $exe -ArgumentList '--exit' -Wait
+    foreach ($p in $running) { $p.WaitForExit(5000) | Out-Null }
+    if (@(Get-Process WatchDog -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe })) { Write-Host 'WatchDog is still running - exit it from the tray icon first (right-click -> 退出).'; exit 1 }
+}
 & $csc /nologo /target:winexe /optimize+ /codepage:65001 "/win32icon:$ico" "/win32manifest:$manifest" "/out:$exe" `
     /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Core.dll `
     /reference:System.Web.Extensions.dll /reference:Microsoft.VisualBasic.dll $src
 $ok = $LASTEXITCODE -eq 0
 Remove-Item $manifest -ErrorAction SilentlyContinue
 if ($ok -and (Test-Path $exe)) { Write-Host "Built: $exe" } else { Write-Host 'Build failed'; exit 1 }
+if ($wasRunning) { Start-Process $exe }   # it was running before: start the new version

@@ -33,6 +33,17 @@ namespace WatchDog
             Application.SetCompatibleTextRenderingDefault(false);
 
             if (selfTest) return SelfTest(a, toolDir, dataDir);
+            // --exit：让正在运行的 WatchDog 存好数据后退出（重新编译前用）
+            if (a.ContainsKey("exit"))
+            {
+                try { using (EventWaitHandle ev = EventWaitHandle.OpenExisting("Local\\yifanwow.WatchDog.Exit")) ev.Set(); } catch { return 0; }
+                for (int i = 0; i < 50; i++)
+                {
+                    Thread.Sleep(200);
+                    try { using (Mutex m = Mutex.OpenExisting("Local\\yifanwow.WatchDog")) { } } catch { return 0; }   // 已经退出
+                }
+                return 1;
+            }
 
             // 只开一个：已经在运行（可能在托盘里）时，把它叫出来，自己退出
             bool own;
@@ -50,11 +61,12 @@ namespace WatchDog
                     return 0;
                 }
                 using (EventWaitHandle show = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\yifanwow.WatchDog.Show"))
+                using (EventWaitHandle exit = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\yifanwow.WatchDog.Exit"))
                 using (Monitor form = new Monitor(toolDir, dataDir, false, null, Get(a, "chart", "mem"), Get(a, "range", "30m")))
                 {
                     form.Prepare(true);
                     form.StartTimer();
-                    form.ListenForShow(show);
+                    form.ListenForShow(show, exit);
                     Application.Run(form);
                 }
                 mutex.ReleaseMutex();
@@ -148,6 +160,8 @@ namespace WatchDog
         public void Report(StringBuilder o)
         {
             foreach (BufferedPanel c in cardList) { CardData d = (CardData)c.Tag; o.AppendFormat("{0}: {1} [{2}] {3}\r\n", d.Tag, d.Value, d.Badge, d.Sub); }
+            o.AppendFormat("WATCHDOG: {0} [{1}] {2}\r\n", dog.Value, dog.Badge, dog.Sub);
+            o.AppendFormat("内存 TOP: {0}\r\n", string.Join("，", ((CardData)cardMem.Tag).Top.Select(t => t.Key + " " + (int)t.Value)));
             o.AppendFormat("结论: {0} | {1}\r\n", verdict[0], verdict[2]);
             foreach (Issue i in issues) o.AppendFormat("  - [{0}] {1} | {2} | -> {3}\r\n", i.Level, i.Title, i.Sub, i.Target);
             o.AppendLine("评级:");

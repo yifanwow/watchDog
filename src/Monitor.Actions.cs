@@ -22,6 +22,7 @@ namespace WatchDog
             selected = string.IsNullOrEmpty(select) ? null : select;
             chartMode = startChart; chartRange = startRange;
             CreateTheme();
+            LoadNotes();
             BuildUI();
             if (!selfTest) BuildTray();
         }
@@ -43,10 +44,15 @@ namespace WatchDog
         }
 
         // 再次双击 WatchDog.exe 时，新开的那个会发信号过来：把窗口从托盘里叫出来
-        public void ListenForShow(System.Threading.EventWaitHandle ev)
+        // WatchDog.exe --exit 发来的信号：存好数据后退出（重新编译前用）
+        public void ListenForShow(System.Threading.EventWaitHandle ev, System.Threading.EventWaitHandle exit)
         {
             showTimer = new Timer(); showTimer.Interval = 400;
-            showTimer.Tick += delegate { if (ev.WaitOne(0)) ShowFromTray(); };
+            showTimer.Tick += delegate
+            {
+                if (exit.WaitOne(0)) { reallyExit = true; Close(); return; }
+                if (ev.WaitOne(0)) ShowFromTray();
+            };
             showTimer.Start();
         }
 
@@ -70,8 +76,9 @@ namespace WatchDog
             double worst = Math.Max(pct, 100 * commitGB / limitGB);
             int lvl = worst < 70 ? 0 : worst < 85 ? 1 : 2;
             SetCard(cardMem, string.Format("{0:N1} / {1:N0} GB", usedGB, totalGB), string.Format("{0}  {1:N0}%", new[] { "正常", "偏高", "紧张" }[lvl], pct), lvl,
-                string.Format("已提交 {0:N1} / {1:N0} GB · 70% 以下都算正常", commitGB, limitGB), pct);
+                string.Format("已提交 {0:N1} / {1:N0} GB（含虚拟内存）", commitGB, limitGB), pct);
             Record("sys:mem", usedGB, nowU);
+            string memExtra = string.Format("可用 {0:N1} GB · 70% 以下都算正常", m.ullAvailPhys / 1073741824.0);
             if (tray != null) tray.Text = string.Format("WatchDog · 内存 {0:N1} / {1:N0} GB ({2:N0}%)", usedGB, totalGB, pct);
 
             // 进程采样 + 规则
@@ -92,6 +99,7 @@ namespace WatchDog
             if (selected != null && byName.ContainsKey(selected)) rec[selected] = byName[selected];
             foreach (ProcRow r in rec.Values) Record(r.Name, r.PrivMB, nowU);
             EvalRules();
+            SetMemExtra(memExtra, real.OrderByDescending(r => r.PrivMB).Take(3).Select(r => new KeyValuePair<string, double>(r.Name, r.PrivMB)).ToList());
             Dictionary<string, Rating> rts = new Dictionary<string, Rating>();
             foreach (ProcRow r in all) rts[r.Name] = GetRating(r.Name, r.PrivMB);
             ratings = rts;
@@ -123,13 +131,14 @@ namespace WatchDog
 
             // 看门狗 + 自身占用
             SysRow last = sys.Count > 0 ? sys[sys.Count - 1] : null;
-            string selfTxt = string.Format("本窗口 {0:N0} MB · CPU {1:N1}%", selfMB, selfCpu);
-            if (!taskInstalled) SetCard(cardDog, "未安装", "离线", 1, selfTxt + " · 看门狗未安装", -1);
-            else if (last == null) SetCard(cardDog, "等待首次检查", "待命", 1, selfTxt + " · 等待第一次检查", -1);
+            if (!taskInstalled) SetDog("未安装", "离线", 1, "看门狗还没安装：点下面\"安装看门狗\"", -1);
+            else if (last == null) SetDog("等待首次检查", "待命", 1, "安装好了，等第一次检查（最多 10 分钟）", -1);
             else
             {
                 double mins = (now - last.T).TotalMinutes; bool ok = mins <= 25;
-                SetCard(cardDog, "上次 " + Ago(last.T), ok ? "运行中" : "可能停了", ok ? 0 : 2, string.Format("{0} · 后台每次 {1:N1} 秒", selfTxt, last.RunMs / 1000), Math.Min(100, mins * 10));
+                string sub = last.HasSelf ? string.Format("每次跑 {0:N1} 秒 · CPU {1:N1} 秒 · 峰值 {2:N0} MB，用完即退出", last.RunMs / 1000, last.SelfCpuSec, last.SelfPeakMB)
+                    : string.Format("每次跑 {0:N1} 秒，用完即退出", last.RunMs / 1000);
+                SetDog("上次 " + Ago(last.T), ok ? "运行中" : "可能停了", ok ? 0 : 2, sub, Math.Min(100, mins * 10));
             }
 
             BuildIssues(all, real);
@@ -157,7 +166,7 @@ namespace WatchDog
                     ListViewItem it;
                     if (i < lv.Items.Count) it = lv.Items[i];
                     else { it = new ListViewItem(""); for (int k = 1; k < 8; k++) it.SubItems.Add(""); lv.Items.Add(it); }
-                    string desc; Desc.TryGetValue(r.Name, out desc);
+                    string desc = DescOf(r.Name);
                     string[] vals = { r.Name, desc ?? "", string.Format("{0:N0}", r.PrivMB), string.Format("{0:N1}", r.CpuPct), string.Format("{0:N1}", r.IoMBs),
                         rt.Text, rt.Trend, rt.Forecast.Length > 0 ? rt.Forecast : rt.Note };
                     for (int k = 0; k < 8; k++) if (it.SubItems[k].Text != vals[k]) it.SubItems[k].Text = vals[k];
@@ -219,7 +228,7 @@ namespace WatchDog
         {
             Issue i = new Issue(); i.Title = title; i.Sub = sub; i.Level = level; i.Target = target; i.Key = key; return i;
         }
-        static string Label(string name) { string d; return Desc.TryGetValue(name, out d) ? name + "（" + d + "）" : name; }
+        string Label(string name) { string d = DescOf(name); return d != null ? name + "（" + d + "）" : name; }
 
         // ---------- 操作 ----------
         bool Ask(string msg) { return MessageBox.Show(this, msg, "WATCHDOG", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes; }
