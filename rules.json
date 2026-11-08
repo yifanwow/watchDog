@@ -1,0 +1,47 @@
+[
+  {
+    "id": "nvidia-nvtopps",
+    "title": "NVIDIA 数据库膨胀",
+    "target": "svc:NVDisplay.ContainerLocalSystem",
+    "when": { "file": "C:\\ProgramData\\NVIDIA Corporation\\nvtopps\\nvtopps.db3", "minFileMB": 300 },
+    "cause": "NVIDIA 显示容器的 nvtopps.db3 数据库异常变大（正常只有几 MB）。容器每次启动都把它读进内存并反复改写，导致占用几 GB 内存、硬盘一直在写。",
+    "fix": { "type": "script", "script": "Fix-NvTopps.ps1", "label": "重建 NVIDIA 数据库（屏幕可能闪一下）" },
+    "auto": true
+  },
+  {
+    "id": "nvidia-container-high",
+    "title": "NVIDIA 显示容器占用过高",
+    "target": "svc:NVDisplay.ContainerLocalSystem",
+    "when": { "process": "svc:NVDisplay.ContainerLocalSystem", "minMB": 1500 },
+    "cause": "NVIDIA 显示容器正常只占 100–200 MB。多数情况是 nvtopps.db3 数据库膨胀引起的；数据库不大时，重启这个服务也能释放内存。",
+    "fix": { "type": "restartService", "service": "NVDisplay.ContainerLocalSystem", "label": "重启 NVIDIA 显示容器（屏幕可能闪一下）" },
+    "auto": true
+  },
+  {
+    "id": "audiosrv-leak",
+    "title": "Windows 音频服务内存泄漏",
+    "target": "svc:Audiosrv",
+    "when": { "process": "svc:Audiosrv", "minMB": 1000 },
+    "cause": "Windows 音频服务正常只占几十 MB。通常是声卡增强插件（Nahimic、Sonic Studio、部分 Realtek 音效）引起，长时间不重启会越涨越大。",
+    "fix": { "type": "restartService", "service": "Audiosrv", "label": "重启音频服务（声音断 2–3 秒）" },
+    "auto": true
+  },
+  {
+    "id": "lghub-tray",
+    "title": "罗技 G HUB 托盘泄漏",
+    "target": "lghub_system_tray",
+    "when": { "process": "lghub_system_tray", "minMB": 800 },
+    "cause": "G HUB 托盘程序的已知问题，长时间运行可涨到几 GB。它只是托盘界面，重启它不影响鼠标键盘的设置和灯效。",
+    "fix": { "type": "restartProcess", "label": "重启 G HUB 托盘" },
+    "auto": true
+  },
+  {
+    "id": "asus-aura",
+    "title": "华硕 Aura 灯效服务占用过高",
+    "target": "svc:LightingService",
+    "when": { "process": "svc:LightingService", "minMB": 1200 },
+    "cause": "华硕 Aura 灯效服务正常只占几十 MB，长时间运行偶尔会越涨越大。",
+    "fix": { "type": "restartService", "service": "LightingService", "label": "重启 Aura 灯效服务（灯效会闪一下）" },
+    "auto": true
+  }
+]

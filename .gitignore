@@ -1,3 +1,5 @@
 # Local history and logs (contain info about this PC)
 data/
 *.log
+# Your own rules
+rules.local.json

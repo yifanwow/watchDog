@@ -1,16 +1,21 @@
 # Fix NVDisplay.Container high memory / disk use caused by a bloated nvtopps.db3.
 # Stops the NVIDIA display container, renames the nvtopps folder (NVIDIA rebuilds a fresh one), starts it again.
-# The old folder is kept as nvtopps.bak-<time>; delete it yourself once everything works.
+# Keeps ONE backup (nvtopps.bak), replacing the previous one, so backups never pile up.
+#   -Quiet : no "press Enter" at the end (used by the watchdog)
+param([switch]$Quiet)
+
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $extra = if ($Quiet) { '-Quiet' } else { '' }
+    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $extra"
     exit
 }
 
 $out  = Join-Path $PSScriptRoot 'Fix-NvTopps.log'
 $name = 'NVDisplay.ContainerLocalSystem'
 $dir  = 'C:\ProgramData\NVIDIA Corporation\nvtopps'
-function Log($m) { $l = '{0:HH:mm:ss} {1}' -f (Get-Date), $m; Write-Host $l; Add-Content $out $l }
+$bak  = "$dir.bak"
+function Log($m) { $l = '{0:yyyy-MM-dd HH:mm:ss} {1}' -f (Get-Date), $m; Write-Host $l; Add-Content $out $l -Encoding UTF8 }
 
 $old = (Get-CimInstance Win32_Service -Filter "Name='$name'").ProcessId
 Log "stopping $name (pid $old)"
@@ -21,8 +26,8 @@ Get-Process NVDisplay.Container -ErrorAction SilentlyContinue | Stop-Process -Fo
 Start-Sleep 1
 
 if (Test-Path $dir) {
-    $bak = "$dir.bak-{0:yyyyMMdd-HHmm}" -f (Get-Date)
-    try { Rename-Item $dir $bak -ErrorAction Stop; Log "renamed nvtopps -> $(Split-Path $bak -Leaf)" }
+    if (Test-Path $bak) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
+    try { Rename-Item $dir $bak -ErrorAction Stop; Log 'renamed nvtopps -> nvtopps.bak' }
     catch { Log "rename failed: $($_.Exception.Message)" }
 }
 
@@ -30,6 +35,6 @@ Start-Service $name
 Start-Sleep 10
 $s = Get-CimInstance Win32_Service -Filter "Name='$name'"
 $p = Get-Process -Id $s.ProcessId -ErrorAction SilentlyContinue
-Log ("after: {0} pid {1}, {2} MB" -f $s.State, $s.ProcessId, [int]($p.PrivateMemorySize64/1MB))
-if (Test-Path "$dir\nvtopps.db3") { Log ("new nvtopps.db3: {0:N1} MB" -f ((Get-Item "$dir\nvtopps.db3").Length/1MB)) }
-Read-Host 'Done. Press Enter to close'
+Log ("after: {0} pid {1}, {2} MB" -f $s.State, $s.ProcessId, [int]($p.PrivateMemorySize64 / 1MB))
+if (Test-Path "$dir\nvtopps.db3") { Log ("new nvtopps.db3: {0:N1} MB" -f ((Get-Item "$dir\nvtopps.db3").Length / 1MB)) }
+if (-not $Quiet) { Read-Host 'Done. Press Enter to close' }

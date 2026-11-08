@@ -1,0 +1,20 @@
+[
+  {
+    "id": "my-app-example",
+    "title": "示例：某个程序占用过高时自动重启",
+    "target": "SomeApp",
+    "when": { "process": "SomeApp", "minMB": 2000 },
+    "cause": "把 SomeApp 换成任务管理器“详细信息”里的进程名（不带 .exe）。minMB 是触发的内存上限。",
+    "fix": { "type": "restartProcess", "label": "重启 SomeApp" },
+    "auto": true
+  },
+  {
+    "id": "my-notice-example",
+    "title": "示例：只提醒、不自动处理",
+    "target": "Weixin",
+    "when": { "process": "Weixin", "minMB": 3000 },
+    "cause": "fix.type 设为 none、auto 设为 false 时，只在窗口里提醒，看门狗不会动它。",
+    "fix": { "type": "none", "label": "方便时手动重启" },
+    "auto": false
+  }
+]
