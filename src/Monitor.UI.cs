@@ -116,6 +116,7 @@ namespace WatchDog
 
         // ---------- 控件 ----------
         BufferedPanel header, cards, diag, detail, actions, chart, status;
+        Panel side;
         BufferedPanel cardMem, cardCpu, cardDisk;
         BufferedPanel[] cardList;
         CardData dog = new CardData { Tag = "WATCHDOG", Title = "看门狗", Mode = "dog" };   // 画在体检结论的上半部分
@@ -148,7 +149,8 @@ namespace WatchDog
         void BuildUI()
         {
             Text = "WATCHDOG // 内存 · CPU · 磁盘 监控";
-            Size = new Size(1340, 980); MinimumSize = new Size(1150, 920);
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;   // 屏幕够高就开高一点，右侧栏更宽松
+            Size = new Size(Math.Min(1340, wa.Width), Math.Max(920, Math.Min(1060, wa.Height))); MinimumSize = new Size(1150, 920);
             StartPosition = FormStartPosition.CenterScreen;
             Font = fCN; BackColor = cBg; ForeColor = cText;
             try { formIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); Icon = formIcon; } catch { }
@@ -171,19 +173,24 @@ namespace WatchDog
                 cardDisk.SetBounds(wm + 24 + ws, 0, cards.ClientSize.Width - (wm + 24 + ws), 136);
             };
 
-            // 右侧栏（从标题条一直到底）：体检结论（含看门狗，占剩下的高度）/ 选中程序 / 操作。都是固定布局，不会出现滚动条
-            Panel side = new Panel(); side.Dock = DockStyle.Right; side.Width = 372; side.BackColor = cBg; side.Padding = new Padding(0, 0, 12, 0);
-            diag = new BufferedPanel(); diag.Dock = DockStyle.Fill; diag.Cursor = Cursors.Hand;
+            // 右侧栏（从标题条一直到底）：当前用户 / 体检结论（含看门狗，按内容定高度）/ 选中程序（占剩下的）/ 操作。不会出现滚动条
+            side = new Panel(); side.Dock = DockStyle.Right; side.Width = 372; side.BackColor = cBg; side.Padding = new Padding(0, 0, 12, 0);
+            BuildProfile();
+            diag = new BufferedPanel(); diag.Dock = DockStyle.Top; diag.Height = 300; diag.Cursor = Cursors.Hand;
             diag.Paint += PaintDiag; diag.MouseClick += DiagClick;
-            detail = new BufferedPanel(); detail.Dock = DockStyle.Bottom; detail.Height = 262;
+            detail = new BufferedPanel(); detail.Dock = DockStyle.Fill;
             detail.Paint += PaintDetail;
+            detail.Resize += delegate { LayoutDetailButtons(); };
             actions = new BufferedPanel(); actions.Dock = DockStyle.Bottom; actions.Height = 178;
             actions.Paint += delegate(object s, PaintEventArgs e) { Frame(e.Graphics, actions.Width, actions.Height, "ACTIONS", "操作", false); };
-            side.Controls.Add(diag);
-            side.Controls.Add(Spacer(10, DockStyle.Bottom));
             side.Controls.Add(detail);
+            side.Controls.Add(Spacer(10));
+            side.Controls.Add(diag);
+            side.Controls.Add(Spacer(10));
+            side.Controls.Add(profile);
             side.Controls.Add(Spacer(10, DockStyle.Bottom));
             side.Controls.Add(actions);
+            side.Resize += delegate { LayoutSide(); };
 
             // 主区域：卡片 + 走势图 + 程序列表
             Panel main = new Panel(); main.Dock = DockStyle.Fill; main.BackColor = cBg; main.Padding = new Padding(12, 0, 12, 0);
@@ -479,9 +486,44 @@ namespace WatchDog
             if (hitByTarget.TryGetValue(name, out hit))
             {
                 Txt(g, "已知问题：" + hit.Rule.Title, fCNb, LevelColor(rt.Level), 14, 144, w - 28, 18);
-                Txt(g, hit.Why + "。" + hit.Rule.Cause, fCN, cGray, 14, 164, w - 28, 30, tfW);
+                Txt(g, hit.Why + "。" + hit.Rule.Cause, fCN, cGray, 14, 164, w - 28, Math.Max(18, h - 48 - 164), tfW);
             }
             else if (rt.Forecast.Length > 0) Txt(g, rt.Forecast, fCNb, LevelColor(rt.Level), 14, 144, w - 28, 18);
+            // 剩下的空间：近 30 分钟的小走势 + 统计
+            int top = hit != null ? 200 : rt.Forecast.Length > 0 ? 170 : 148, bottom = h - 50;
+            if (bottom - top >= 40) PaintMini(g, name, 14, top, w - 28, bottom - top);
+        }
+        void PaintMini(Graphics g, string name, int x, int y, int w, int h)
+        {
+            Ring mem, cpu, io;
+            if (!series.TryGetValue(name, out mem) || mem.Count < 2) return;
+            series.TryGetValue("cpu:" + name, out cpu); series.TryGetValue("io:" + name, out io);
+            long from = DateTime.UtcNow.AddMinutes(-30).Ticks;
+            double lo = double.MaxValue, hi = 0; int first = -1;
+            for (int i = 0; i < mem.Count; i++) { if (mem.TimeAt(i) < from) continue; if (first < 0) first = i; double v = mem.ValueAt(i); lo = Math.Min(lo, v); hi = Math.Max(hi, v); }
+            if (first < 0 || mem.Count - first < 2) return;
+            g.FillRectangle(bDimLine, x, y, w, 1);
+            Txt(g, "// 近 30 分钟", fSmall, cAccent, x, y + 4, 90, 14);
+            Txt(g, string.Format("内存 {0:N0} – {1:N0} MB", lo, hi), fCN, cText, x + 88, y + 2, w - 88, 18);
+            Txt(g, string.Format("CPU 平均 {0:N1}% · 读写平均 {1:N1} MB/s", Avg(cpu, from), Avg(io, from)), fCN, cGray, x + 88, y + 20, w - 88, 18);
+            int cy = y + 42, ch = h - 44;
+            if (ch < 16) return;
+            g.FillRectangle(bDeep, x, cy, w, ch);
+            double span = Math.Max(hi - lo, Math.Max(hi * 0.02, 1));
+            List<PointF> pts = new List<PointF>();
+            long now = DateTime.UtcNow.Ticks, len = now - from;
+            for (int i = first; i < mem.Count; i++)
+                pts.Add(new PointF(x + (float)(w * (double)(mem.TimeAt(i) - from) / len), cy + ch - 3 - (float)((ch - 6) * (mem.ValueAt(i) - lo) / span)));
+            PointF[] arr = pts.ToArray();
+            g.DrawLines(pPulseGlow, arr); g.DrawLines(pPulse, arr);
+            g.FillRectangle(bLv[0], arr[arr.Length - 1].X - 2, arr[arr.Length - 1].Y - 2, 4, 4);
+        }
+        static double Avg(Ring r, long from)
+        {
+            if (r == null) return 0;
+            double sum = 0; int n = 0;
+            for (int i = 0; i < r.Count; i++) if (r.TimeAt(i) >= from) { sum += r.ValueAt(i); n++; }
+            return n == 0 ? 0 : sum / n;
         }
 
         // ---------- 程序列表 ----------
@@ -782,9 +824,11 @@ namespace WatchDog
         void BuildButtons()
         {
             // 选中程序的按钮：主按钮的文字随规则变化（命中规则时显示对应的修复方法）
-            btnPrimary = NewBtn(detail, "重启这个程序", 14, 194, 334, delegate { FixSelected(); }, true);
-            btnKill = NewBtn(detail, "结束", 14, 226, 163, delegate { KillTarget(selected); }, false);
-            btnOpen = NewBtn(detail, "打开位置", 185, 226, 163, delegate { OpenLocation(selected); }, false);
+            // 选中程序的三个按钮排一行，贴在面板底部（面板高度会变）
+            btnPrimary = NewBtn(detail, "重启这个程序", 14, 0, 174, delegate { FixSelected(); }, true);
+            btnKill = NewBtn(detail, "结束", 194, 0, 72, delegate { KillTarget(selected); }, false);
+            btnOpen = NewBtn(detail, "打开位置", 272, 0, 76, delegate { OpenLocation(selected); }, false);
+            LayoutDetailButtons();
             // 操作区按钮（两列）
             int ax = 14, half = 163, full = 334, ay = 34, step = 34;
             NewBtn(actions, "一键修复全部问题", ax, ay, full, delegate { FixAll(); }, true); ay += step;
@@ -802,6 +846,22 @@ namespace WatchDog
                 ReloadSoon(15);
             }, false);
             NewBtn(actions, "打开工具文件夹", ax + half + 8, ay, half, delegate { StartShell("explorer.exe", "\"" + ToolDir + "\""); }, false);
+        }
+        void LayoutDetailButtons()
+        {
+            if (btnPrimary == null) return;
+            int y = Math.Max(150, detail.Height - 42);
+            foreach (Button b in new[] { btnPrimary, btnKill, btnOpen }) if (b.Top != y) b.Top = y;
+        }
+        // 体检结论按内容定高度（问题数 + 最近 5 次检查），剩下的高度都给"选中的程序"
+        void LayoutSide()
+        {
+            if (side == null || diag == null) return;
+            int logLines = Math.Min(5, sys.Count);
+            int need = DogY + DogH + 8 + 48 + issues.Count * 38 + (logLines > 0 ? 6 + 22 + logLines * 17 + 2 : 0) + 12;
+            int max = side.ClientSize.Height - ProfileH - 10 - 10 - 10 - actions.Height - 214;   // "选中的程序"至少留 214
+            int hgt = Math.Max(DogY + DogH + 8 + 48 + 50, Math.Min(need, max));
+            if (diag.Height != hgt) diag.Height = hgt;
         }
         static void SetText(Control c, string text) { if (c.Text != text) c.Text = text; }   // 文字真的变了才改，避免无谓重绘
         void UpdateDetailButtons()
@@ -901,6 +961,7 @@ namespace WatchDog
                 foreach (Bitmap b in icons.Values) if (b != null) b.Dispose();
                 icons.Clear();
                 if (formIcon != null) formIcon.Dispose();
+                if (avatar != null) avatar.Dispose();
             }
             base.Dispose(disposing);
             if (disposing) { foreach (IDisposable o in gdi) o.Dispose(); gdi.Clear(); }   // 控件都释放后再释放字体和画刷

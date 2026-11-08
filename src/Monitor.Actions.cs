@@ -23,6 +23,7 @@ namespace WatchDog
             chartMode = startChart; chartRange = startRange;
             CreateTheme();
             LoadNotes();
+            LoadProfile();
             BuildUI();
             if (!selfTest) BuildTray();
         }
@@ -182,7 +183,8 @@ namespace WatchDog
             int nIg = ActiveIgnores().Count;
             SetText(btnIgnored, nIg > 0 ? "已忽略的问题（" + nIg + "）" : "已忽略的问题");
 
-            header.Invalidate(); status.Invalidate(); chart.Invalidate(); detail.Invalidate();
+            UpdateDiskInfo();
+            header.Invalidate(); status.Invalidate(); profile.Invalidate(); chart.Invalidate(); detail.Invalidate();
         }
 
         // 体检结论：规则命中 + 稳定性问题 + 大量读写
@@ -223,6 +225,7 @@ namespace WatchDog
                 : new[] { "电脑健康", "0", basis };
             if (lastAction.Length > 0 && list.Count < 3) list.Add(NewIssue("看门狗最近一次动作", lastAction, -1, null, null));
             issues = list;
+            LayoutSide();
             diag.Invalidate();
         }
         static Issue NewIssue(string title, string sub, int level, string target, string key)
