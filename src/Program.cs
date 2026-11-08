@@ -138,7 +138,7 @@ namespace WatchDog
         public int IconCount { get { return icons.Count; } }
         public int SeriesCount { get { return series.Count; } }
         public void SaveLiveNow() { SaveLive(); }
-        public void SetMetric(string m) { procMetric = m; }
+        public void SetMetric(string m) { if (m == "pct") memPct = true; else procMetric = m; }
         public void ForceClose() { reallyExit = true; Close(); }
 
         // 仅自测：预先填入最近 N 分钟的模拟实时数据

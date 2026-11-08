@@ -15,7 +15,7 @@ namespace WatchDog
         public int Level = -1; public double Pct = -1;
         public List<KeyValuePair<string, double>> Top = new List<KeyValuePair<string, double>>();   // 内存卡片右侧：占用最多的程序
     }
-    class Line { public long[] T; public double[] V; public int Level; public string Name; public PointF? LastPt; }
+    class Line { public long[] T; public double[] V; public int Level; public string Name; public PointF? LastPt; public bool Right; }   // Right = 用右侧 0–100% 刻度
     class ChartData { public string Title = "", Unit = "", Note = "", Msg; public double FixedMax; public bool Zero; public List<Line> Lines = new List<Line>(); }
 
     partial class Monitor : Form
@@ -136,7 +136,8 @@ namespace WatchDog
         List<object[]> issueRects = new List<object[]>();   // [y0, y1, target, key, title, bx1, bx2]
         List<object[]> rangeRects = new List<object[]>();   // [x0, x1, key]
         List<object[]> metricRects = new List<object[]>();  // [x0, x1, mem|cpu|io]
-        string procMetric = "mem";                           // 选中程序时走势图看哪一项
+        string procMetric = "mem";
+        bool memPct;                                         // 整机内存走势上是否显示黄色百分比线                           // 选中程序时走势图看哪一项
         static readonly string[][] ProcMetrics = { new[] { "mem", "内存" }, new[] { "cpu", "CPU" }, new[] { "io", "读写" } };
 
         // 走势图可选的时间范围（小时）。默认近 30 分钟
@@ -631,6 +632,13 @@ namespace WatchDog
                 case "mem":
                     d.Title = "整机内存占用"; d.Unit = "GB"; d.Note = lng ? rec : live;
                     d.Lines.Add(lng ? HistLine(sys, x => x.T, x => x.UsedMB / 1024, 0, "已用") : RingLine("sys:mem", 0, "已用"));
+                    if (memPct)
+                    {
+                        // 黄色线：占总内存的百分比，用右侧固定的 0–100% 刻度，一眼看出离满还有多远
+                        double totalGB = Native.Mem().ullTotalPhys / 1073741824.0;
+                        Line pl = lng ? HistLine(sys, x => x.T, x => x.UsedMB / 1024 / totalGB * 100, 1, "占比") : RingLine("sys:mem", 1, "占比");
+                        if (pl != null) { if (!lng) for (int i = 0; i < pl.V.Length; i++) pl.V[i] = pl.V[i] / totalGB * 100; pl.Right = true; d.Lines.Add(pl); }
+                    }
                     break;
                 case "cpu":
                     d.Title = "CPU 占用"; d.Unit = "%"; d.FixedMax = 100; d.Note = lng ? inst : live;
@@ -689,8 +697,16 @@ namespace WatchDog
             int x = w - 24 - RangeKeys.Length * (rw + gap) + gap;
             Txt(g, "近", fCN, cGray, x - 26, 7, 22, 20, tfR);
             int titleEnd = x - 34;
-            // 选中程序时：内存 / CPU / 读写 切换
+            // 选中程序时：内存 / CPU / 读写 切换；整机内存时：显示 / 隐藏百分比线
             List<object[]> mrects = new List<object[]>();
+            if (chartMode == "mem")
+            {
+                int mw = 76, mx = x - 40 - mw;
+                if (memPct) { g.FillRectangle(bLv[1], mx, 7, mw, 20); Txt(g, "% 占比 ON", fCNb, cBg, mx, 7, mw, 20, tfC); }
+                else { g.DrawRectangle(pAccDim, mx, 7, mw, 20); Txt(g, "% 占比", fCN, cYellow, mx, 7, mw, 20, tfC); }
+                mrects.Add(new object[] { mx, mx + mw, "pct" });
+                titleEnd = mx - 10;
+            }
             if (chartMode == "proc" && selected != null)
             {
                 int mw = 48, mx = x - 40 - ProcMetrics.Length * (mw + 4);
@@ -715,7 +731,9 @@ namespace WatchDog
             long end = DateTime.UtcNow.Ticks, spanT = TimeSpan.FromHours(RangeHours[range]).Ticks, begin = end - spanT;
             // 只留在这段时间里至少有 2 个点的线
             List<Line> lines = data.Lines.Where(l => l.T.Count(t => t >= begin) >= 2).ToList();
-            const int L = 70, R = 24, T = 36, B = 42;
+            bool right = lines.Any(l => l.Right);
+            const int L = 70, T = 36, B = 42;
+            int R = right ? 54 : 24;
             int pw = w - L - R, ph = h - T - B;
             Txt(g, data.Note, fCN, cGray, 14, h - 22, w - 200, 16);
             if (lines.Count == 0)
@@ -727,7 +745,7 @@ namespace WatchDog
                 return;
             }
             double max = 0, min = double.MaxValue;
-            foreach (Line ln in lines) for (int i = 0; i < ln.V.Length; i++) { if (ln.T[i] < begin) continue; max = Math.Max(max, ln.V[i]); min = Math.Min(min, ln.V[i]); }
+            foreach (Line ln in lines) for (int i = 0; i < ln.V.Length; i++) { if (ln.T[i] < begin || ln.Right) continue; max = Math.Max(max, ln.V[i]); min = Math.Min(min, ln.V[i]); }
             if (min == double.MaxValue) min = 0;
             double lo, hi;
             if (data.FixedMax > 0) { lo = 0; hi = data.FixedMax; }
@@ -739,6 +757,7 @@ namespace WatchDog
                 float y = T + ph * i / 3f;
                 g.DrawLine(pGrid, L, y, L + pw, y);
                 Txt(g, string.Format(fmt, hi - (hi - lo) * i / 3) + " " + data.Unit, fSmall, cGray, 4, y - 9, L - 10, 18, tfR);
+                if (right) Txt(g, string.Format("{0:N0}%", 100 - 100 * i / 3.0), fSmall, cYellow, L + pw + 6, y - 9, R - 8, 18);
             }
             int ticks = range == "3h" || range == "12h" ? 6 : 4;
             for (int k = 0; k <= ticks; k++)
@@ -756,11 +775,12 @@ namespace WatchDog
                 for (int i = 0; i < ln.V.Length; i++)
                 {
                     if (ln.T[i] < begin) continue;
-                    pts.Add(new PointF((float)(L + pw * (double)(ln.T[i] - begin) / spanT), (float)(T + ph * (1 - (ln.V[i] - lo) / (hi - lo)))));
+                    double fy = ln.Right ? ln.V[i] / 100 : (ln.V[i] - lo) / (hi - lo);
+                    pts.Add(new PointF((float)(L + pw * (double)(ln.T[i] - begin) / spanT), (float)(T + ph * (1 - fy))));
                 }
                 if (pts.Count < 2) continue;
                 PointF[] arr = pts.ToArray();
-                if (lines.Count == 1)
+                if (lines.Count(l => !l.Right) == 1 && !ln.Right)
                 {
                     List<PointF> area = new List<PointF>();
                     area.Add(new PointF(arr[0].X, T + ph)); area.AddRange(arr); area.Add(new PointF(arr[arr.Length - 1].X, T + ph));
@@ -778,7 +798,7 @@ namespace WatchDog
                 if (ln.LastPt == null) continue;
                 int li = Lx(ln.Level); PointF lp = ln.LastPt.Value;
                 g.FillRectangle(bLv[li], lp.X - 4, lp.Y - 4, 8, 8);
-                string txt = string.Format(fmt, ln.V[ln.V.Length - 1]) + " " + data.Unit;
+                string txt = ln.Right ? string.Format("{0:N1} %", ln.V[ln.V.Length - 1]) : string.Format(fmt, ln.V[ln.V.Length - 1]) + " " + data.Unit;
                 if (lines.Count > 1) { Txt(g, ln.Name + " " + txt, fTagB, LevelColor(ln.Level), L + 8, ly, 160, 18); ly += 18; }
                 else Txt(g, txt, fTagB, LevelColor(ln.Level), lp.X - 130, lp.Y - 26, 124, 20, tfR);
                 g.DrawLine(pCyanDash, lp.X, lp.Y + 6, lp.X, T + ph);   // 末端准星线
@@ -789,7 +809,11 @@ namespace WatchDog
         {
             if (e.Y < 4 || e.Y > 30) return;
             foreach (object[] r in metricRects)
-                if (e.X >= (int)r[0] && e.X < (int)r[1]) { procMetric = (string)r[2]; chart.Invalidate(); return; }
+                if (e.X >= (int)r[0] && e.X < (int)r[1])
+                {
+                    if ((string)r[2] == "pct") memPct = !memPct; else procMetric = (string)r[2];
+                    chart.Invalidate(); return;
+                }
             foreach (object[] r in rangeRects)
                 if (e.X >= (int)r[0] && e.X < (int)r[1]) { chartRange = (string)r[2]; chart.Invalidate(); break; }
         }
