@@ -49,6 +49,7 @@ public static class NativeInfo {
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] public static extern int SetWindowTheme(IntPtr h, string app, string id);
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);
     const uint QUERY_LIMITED = 0x1000;
 
     public static MEMSTAT Mem() { MEMSTAT m = new MEMSTAT(); m.dwLength = (uint)Marshal.SizeOf(m); GlobalMemoryStatusEx(ref m); return m; }
@@ -144,8 +145,56 @@ public class Ring {
         return new double[] { num / den, r2, ValueAt(n - 1) - ValueAt(s), span, cv, m };
     }
 }
+// 任务栏图标：Windows 11 的任务栏按"程序"显示图标，我们跑在 powershell.exe 里，默认就显示 PowerShell 的图标。
+// 给窗口设一个自己的 AppUserModelID 和图标，任务栏就会单独显示 WatchDog 的图标。
+[ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IPropertyStore {
+    void GetCount(out uint c);
+    void GetAt(uint i, out PKEY k);
+    void GetValue(ref PKEY k, IntPtr v);
+    void SetValue(ref PKEY k, ref PROPVAR v);
+    void Commit();
+}
+[StructLayout(LayoutKind.Sequential, Pack = 4)] public struct PKEY { public Guid fmtid; public uint pid; }
+[StructLayout(LayoutKind.Explicit, Size = 24)] public struct PROPVAR { [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public IntPtr p; }
+public static class TaskbarId {
+    [DllImport("shell32.dll")] static extern int SHGetPropertyStoreForWindow(IntPtr h, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore ps);
+    static readonly Guid AppModel = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+    static void Set(IPropertyStore ps, uint pid, string val) {
+        PKEY k = new PKEY(); k.fmtid = AppModel; k.pid = pid;
+        PROPVAR v = new PROPVAR();
+        if (val != null) { v.vt = 31; v.p = Marshal.StringToCoTaskMemUni(val); }   // VT_LPWSTR；null = 清除
+        try { ps.SetValue(ref k, ref v); } finally { if (v.p != IntPtr.Zero) Marshal.FreeCoTaskMem(v.p); }
+    }
+    // id = null 时清除（窗口关闭前调用）
+    public static bool Apply(IntPtr hwnd, string id, string icon, string command, string name) {
+        IPropertyStore ps = null;
+        try {
+            Guid iid = typeof(IPropertyStore).GUID;
+            if (SHGetPropertyStoreForWindow(hwnd, ref iid, out ps) != 0 || ps == null) return false;
+            if (id == null) { Set(ps, 2, null); Set(ps, 3, null); Set(ps, 4, null); Set(ps, 5, null); }
+            else {
+                Set(ps, 5, id);                                  // AppUserModel.ID
+                if (command != null) Set(ps, 2, command);        // RelaunchCommand：固定到任务栏后点它启动什么
+                if (icon != null) Set(ps, 3, icon);              // RelaunchIconResource：任务栏图标
+                if (name != null) Set(ps, 4, name);              // RelaunchDisplayNameResource
+            }
+            ps.Commit();
+            return true;
+        } catch { return false; }
+        finally { if (ps != null) Marshal.ReleaseComObject(ps); }
+    }
+}
 public class BufferedPanel : Panel { public BufferedPanel() { DoubleBuffered = true; ResizeRedraw = true; } }
-public class BufferedListView : ListView { public BufferedListView() { DoubleBuffered = true; } }
+// 列表：系统默认先把整块背景擦掉（WM_ERASEBKGND），再一行一行画。我们每行都要跑 PowerShell 的绘制代码，比较慢，
+// 擦掉后、画完前的那一下就会被看到，整张列表像消失了一下。跳过擦除，背景在双缓冲里和各行一起画好，一次显示。
+public class BufferedListView : ListView {
+    public BufferedListView() { DoubleBuffered = true; }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == 0x14) { m.Result = (IntPtr)1; return; }   // WM_ERASEBKGND
+        base.WndProc(ref m);
+    }
+}
 public class CyberColors : ProfessionalColorTable {
     static Color bg = Color.FromArgb(24, 11, 14), sel = Color.FromArgb(70, 20, 26), acc = Color.FromArgb(255, 95, 87);
     public override Color ToolStripDropDownBackground { get { return bg; } }
@@ -595,6 +644,23 @@ function Frame($g, $w, $h, $tag, $title, [switch]$Active) {
         Txt $g ('// ' + $tag) $fTagB $cAccent 12 8 160 22
         Txt $g $title $fCNb $cGray (18 + (TxtW $g ('// ' + $tag) $fTagB)) 8 160 22
     }
+}
+
+# ---------- 只开一个：已经在运行（可能在托盘里）时，把它叫出来，自己退出 ----------
+$script:showEvent = $null
+if (-not $SelfTest) {
+    $script:mutex = New-Object Threading.Mutex($false, 'Local\yifanwow.WatchDog')
+    $own = $false
+    try { $own = $script:mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $own = $true }   # 上次被强制结束
+    if (-not $own) {
+        try {
+            $ev = [Threading.EventWaitHandle]::OpenExisting('Local\yifanwow.WatchDog.Show')
+            [void][NativeInfo]::AllowSetForegroundWindow(-1)   # 让已经开着的那个可以把窗口提到最前
+            [void]$ev.Set(); $ev.Dispose()
+        } catch { }
+        return
+    }
+    $script:showEvent = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::AutoReset, 'Local\yifanwow.WatchDog.Show')
 }
 
 # ---------- 界面 ----------
@@ -1077,6 +1143,11 @@ $form.Add_HandleCreated({
     [NativeInfo]::Dwm($form.Handle, 35, 0x000C090E)   # 标题栏底色：红黑
     [NativeInfo]::Dwm($form.Handle, 36, 0x00575FFF)   # 标题文字：珊瑚红
     [NativeInfo]::Dwm($form.Handle, 34, 0x00575FFF)   # 窗口边框：珊瑚红
+    # 任务栏显示 WatchDog 自己的图标（不然是 PowerShell 的），固定到任务栏后点它也会通过 WatchDog.exe 启动
+    $exe = Join-Path $ToolDir 'WatchDog.exe'
+    $iconRes = if (Test-Path $exe) { "$exe,0" } elseif (Test-Path $icoPath) { "$icoPath,0" } else { $null }
+    $cmd = if (Test-Path $exe) { '"' + $exe + '"' } else { $null }
+    $script:taskbarSet = [TaskbarId]::Apply($form.Handle, 'yifanwow.WatchDog', $iconRes, $cmd, 'WatchDog')
 })
 $lv.Add_HandleCreated({
     [void][NativeInfo]::SetWindowTheme($lv.Handle, 'DarkMode_Explorer', $null)
@@ -1504,17 +1575,23 @@ if (-not $SelfTest) {
     $trayMenu = New-Object Windows.Forms.ContextMenuStrip
     $trayMenu.Renderer = $menu.Renderer; $trayMenu.BackColor = $menu.BackColor
     $ti = $trayMenu.Items.Add('打开 WatchDog'); $ti.ForeColor = $cText; $ti.Font = $fCNb; $ti.Add_Click({ Show-FromTray })
-    $ti = $trayMenu.Items.Add('退出'); $ti.ForeColor = $cText; $ti.Add_Click({ $form.Close() })
+    $ti = $trayMenu.Items.Add('退出'); $ti.ForeColor = $cText; $ti.Add_Click({ $script:reallyExit = $true; $form.Close() })
     $tray.ContextMenuStrip = $trayMenu
     $tray.Add_MouseClick({ param($s, $e); if ($e.Button -eq [Windows.Forms.MouseButtons]::Left) { Show-FromTray } })
-    $script:lastState = [Windows.Forms.FormWindowState]::Normal; $script:trayTipShown = $false
+    $script:lastState = [Windows.Forms.FormWindowState]::Normal; $script:trayTipShown = $false; $script:reallyExit = $false
+    function Hide-ToTray {
+        $form.Hide(); $tray.Visible = $true
+        if (-not $script:trayTipShown) { $script:trayTipShown = $true; $tray.ShowBalloonTip(3000, 'WatchDog 在托盘里继续记录', '点托盘图标重新打开。要退出：右键托盘图标 → 退出。', [Windows.Forms.ToolTipIcon]::Info) }
+    }
     $form.Add_Resize({
-        if ($form.WindowState -eq [Windows.Forms.FormWindowState]::Minimized) {
-            if ($form.Visible) {
-                $form.Hide(); $tray.Visible = $true
-                if (-not $script:trayTipShown) { $script:trayTipShown = $true; $tray.ShowBalloonTip(3000, 'WatchDog 在托盘里继续记录', '点托盘图标重新打开，右键可以退出。', [Windows.Forms.ToolTipIcon]::Info) }
-            }
-        } else { $script:lastState = $form.WindowState }
+        if ($form.WindowState -eq [Windows.Forms.FormWindowState]::Minimized) { if ($form.Visible) { Hide-ToTray } }
+        else { $script:lastState = $form.WindowState }
+    })
+    # 点右上角关闭 = 缩到托盘；只有托盘菜单的"退出"、关机 / 注销才真正退出
+    $form.Add_FormClosing({
+        param($s, $e)
+        if (-not $script:reallyExit -and ($e.CloseReason -eq [Windows.Forms.CloseReason]::UserClosing -or $e.CloseReason -eq [Windows.Forms.CloseReason]::None)) { $e.Cancel = $true; Hide-ToTray; return }
+        if ($script:taskbarSet) { [void][TaskbarId]::Apply($form.Handle, $null, $null, $null, $null) }
     })
 }
 function Show-FromTray {
@@ -1585,6 +1662,14 @@ $form.Add_FormClosed({
     if ($tray) { $tray.Visible = $false; $tray.Dispose(); $trayMenu.Dispose() }   # 不留下"幽灵"托盘图标
 })
 # 用 Application.Run 而不是 ShowDialog：对话框窗口一隐藏就会结束，没法缩到托盘
+if ($script:showEvent) {
+    # 再次双击 WatchDog.exe 时，新开的那个会发信号过来：把窗口从托盘里叫出来
+    $showTimer = New-Object Windows.Forms.Timer; $showTimer.Interval = 400
+    $showTimer.Add_Tick({ if ($script:showEvent.WaitOne(0)) { Show-FromTray } })
+    $showTimer.Start()
+}
 [Windows.Forms.Application]::Run($form)
+if ($showTimer) { $showTimer.Dispose() }
+if ($script:showEvent) { $script:showEvent.Dispose(); $script:mutex.ReleaseMutex(); $script:mutex.Dispose() }
 $form.Dispose()
 Dispose-All
