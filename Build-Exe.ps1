@@ -1,6 +1,7 @@
-﻿# Build WatchDog.exe: a tiny launcher that opens MemMonitor.ps1 without a console window.
+﻿# Build WatchDog.exe: the monitor window, written in C# (src\*.cs).
 # Uses the C# compiler that ships with Windows (.NET Framework 4), so nothing is downloaded.
-# The exe must stay in this folder, next to MemMonitor.ps1.
+# The exe must stay in this folder: it reads rules.json / rules.local.json / data\ here,
+# and runs the PowerShell helper scripts (watchdog, fixes) from here.
 Add-Type -AssemblyName System.Drawing
 $dir = $PSScriptRoot
 $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -48,33 +49,33 @@ try {
     foreach ($p in $pngs) { $bw.Write($p) }
 } finally { $bw.Close() }
 
-# ---- Launcher source (saved as UTF-8 with BOM so csc reads the Chinese message correctly) ----
-$src = Join-Path $env:TEMP 'WatchDogLauncher.cs'
+# ---- Manifest: modern controls, sharp text on high-DPI screens, Windows 10/11 ----
+$manifest = Join-Path $env:TEMP 'WatchDog.manifest'
 @'
-using System;
-using System.Diagnostics;
-using System.IO;
-using System.Windows.Forms;
-class WatchDogLauncher {
-    [STAThread]
-    static void Main() {
-        string dir = AppDomain.CurrentDomain.BaseDirectory;
-        string ps1 = Path.Combine(dir, "MemMonitor.ps1");
-        if (!File.Exists(ps1)) {
-            MessageBox.Show("找不到 MemMonitor.ps1。请把 WatchDog.exe 放在工具文件夹里。", "WATCHDOG");
-            return;
-        }
-        ProcessStartInfo psi = new ProcessStartInfo("powershell.exe",
-            "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File \"" + ps1 + "\"");
-        psi.UseShellExecute = false;
-        psi.CreateNoWindow = true;
-        psi.WorkingDirectory = dir;
-        Process.Start(psi);
-    }
-}
-'@ | Set-Content $src -Encoding UTF8
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="WatchDog"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2"><security><requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+    <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+  </requestedPrivileges></security></trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1"><application>
+    <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+  </application></compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>
+    <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+  </windowsSettings></application>
+</assembly>
+'@ | Set-Content $manifest -Encoding UTF8
 
 $exe = Join-Path $dir 'WatchDog.exe'
-& $csc /nologo /target:winexe /optimize+ "/win32icon:$ico" "/out:$exe" /reference:System.Windows.Forms.dll $src
-Remove-Item $src -ErrorAction SilentlyContinue
-if (Test-Path $exe) { Write-Host "Built: $exe" } else { Write-Host 'Build failed'; exit 1 }
+$src = @(Get-ChildItem (Join-Path $dir 'src') -Filter '*.cs' | ForEach-Object { $_.FullName })
+if (-not $src) { Write-Host 'src\*.cs not found'; exit 1 }
+# The monitor may be running (it hides in the tray): close it first, the exe file is locked while it runs
+$running = @(Get-Process WatchDog -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe })
+if ($running) { Write-Host 'WatchDog is running - exit it from the tray icon first (right-click -> 退出).'; exit 1 }
+& $csc /nologo /target:winexe /optimize+ /codepage:65001 "/win32icon:$ico" "/win32manifest:$manifest" "/out:$exe" `
+    /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Core.dll `
+    /reference:System.Web.Extensions.dll /reference:Microsoft.VisualBasic.dll $src
+$ok = $LASTEXITCODE -eq 0
+Remove-Item $manifest -ErrorAction SilentlyContinue
+if ($ok -and (Test-Path $exe)) { Write-Host "Built: $exe" } else { Write-Host 'Build failed'; exit 1 }

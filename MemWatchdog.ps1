@@ -1,4 +1,4 @@
-# Memory-leak watchdog + history recorder for MemMonitor.
+# Memory-leak watchdog + history recorder for the WatchDog monitor window.
 # Runs as a scheduled task every 10 minutes, takes a few seconds, then exits.
 # It never stays resident, so it cannot leak memory itself.
 # What to check and how to fix it comes from rules.json (shared) + rules.local.json (your own, not in git).
@@ -30,7 +30,7 @@ function Load-Rules {
     $all
 }
 
-# ignore.json (written by MemMonitor): problems the user chose to ignore for 24 h or confirmed as normal.
+# ignore.json (written by the WatchDog window): problems the user chose to ignore for 24 h or confirmed as normal.
 # A rule whose key "rule:<id>" is ignored is not fixed automatically.
 function Load-Ignored {
     $set = @{}
@@ -112,7 +112,7 @@ foreach ($r in $rules) {
     try { Invoke-Fix $r; $fixedTargets[$r.target] = 1 } catch { Log ("  failed: {0}" -f $_.Exception.Message) }
 }
 
-# ---- History for MemMonitor: one small CSV per day, old days deleted ----
+# ---- History for the WatchDog window: one small CSV per day, old days deleted ----
 if ($DryRun) { return }
 $dataDir = Join-Path $PSScriptRoot 'data'
 if (-not (Test-Path $dataDir)) { New-Item -ItemType Directory -Path $dataDir | Out-Null }

@@ -6,5 +6,7 @@ rules.local.json
 # Built by Build-Exe.ps1
 WatchDog.exe
 WatchDog.ico
+# Self-test report (WatchDog.exe --selftest)
+selftest.txt
 # Problems you ignored / confirmed normal
 ignore.json
