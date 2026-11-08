@@ -329,9 +329,10 @@ $fCNb   = New-Object Drawing.Font('Microsoft YaHei UI', 9, [Drawing.FontStyle]::
 $fCNbig = New-Object Drawing.Font('Microsoft YaHei UI', 12, [Drawing.FontStyle]::Bold)
 $fTagB  = New-Object Drawing.Font('Bahnschrift SemiBold SemiConden', 10)
 $fNum   = New-Object Drawing.Font('Bahnschrift SemiBold', 20)
+$fNumCN = New-Object Drawing.Font('Microsoft YaHei UI', 16, [Drawing.FontStyle]::Bold)   # 数值里有中文时用它，Bahnschrift 没有中文字形
 $fHead  = New-Object Drawing.Font('Bahnschrift SemiBold', 18)
 $fSmall = New-Object Drawing.Font('Bahnschrift', 8.5)
-$Fonts  = @($fCN, $fCNb, $fCNbig, $fTagB, $fNum, $fHead, $fSmall)
+$Fonts  = @($fCN, $fCNb, $fCNbig, $fTagB, $fNum, $fNumCN, $fHead, $fSmall)
 
 $GDI = @{}   # 统一保存，关闭时一起释放
 function Brush($name, $color) { $GDI[$name] = New-Object Drawing.SolidBrush($color) }
@@ -431,7 +432,8 @@ function New-Card($tag, $title, $code) {
             $g.FillPolygon($GDI["lv$lvl"], [Drawing.PointF[]]@((New-Object Drawing.PointF(($bx + 8), $by)), (New-Object Drawing.PointF(($bx + 104), $by)), (New-Object Drawing.PointF(($bx + 96), ($by + 22))), (New-Object Drawing.PointF($bx, ($by + 22)))))
             Txt $g $d.Badge $fCNb $cBg $bx $by 104 22 $tfC
         }
-        Txt $g $d.Value $fNum $cCyan 10 34 ($w - 20) 36
+        $vf = if ([string]$d.Value -match '[^\x00-\x7F]') { $fNumCN } else { $fNum }
+        Txt $g $d.Value $vf $cCyan 10 34 ($w - 20) 36
         if ($d.Pct -ge 0) {
             $n = 24; $gap = 3; $bw = ($w - 24 - $gap * ($n - 1)) / $n
             $on = [math]::Round($n * [math]::Min(100, $d.Pct) / 100)
@@ -771,8 +773,6 @@ $ax = 14; $aw = 320; $ay = 36; $step = 38
 $btnFix  = New-Btn $actions '一键处理疑似泄漏的程序' $ax $ay $aw { Fix-Leaks } -Primary; $ay += $step
 $btnNow  = New-Btn $actions '立即运行一次看门狗检查' $ax $ay $aw { Run-CheckNow }; $ay += $step
 $btnNv   = New-Btn $actions '修复 NVIDIA 数据库（显示容器占内存 / 狂写硬盘）' $ax $ay $aw { if (Ask '将停止并重建 NVIDIA 的 nvtopps 数据库，屏幕可能闪一下。需要管理员权限。确定吗？') { Run-Tool 'Fix-NvTopps.ps1'; Reload-Soon } }; $ay += $step
-$btnSsOn = New-Btn $actions 'Sonic Studio 开' $ax $ay 156 { Run-Tool 'SonicStudio.ps1' '-Mode On' }
-$btnSsOff = New-Btn $actions 'Sonic Studio 关' ($ax + 164) $ay 156 { Run-Tool 'SonicStudio.ps1' '-Mode Off' }; $ay += $step
 $btnInstall = New-Btn $actions '安装看门狗（每 10 分钟自动检查）' $ax $ay $aw {
     if ($script:taskState) { if (Ask '将删除看门狗计划任务，之后不再自动检查。确定吗？') { Run-Tool 'Install-Watchdog.ps1' '-Uninstall' } }
     else { Run-Tool 'Install-Watchdog.ps1' }

@@ -8,10 +8,10 @@
 
 | 文件 | 作用 |
 |---|---|
-| `MemMonitor.bat` / `MemMonitor.ps1` | **可视化监控窗口**（赛博朋克风格：红黑底 + 荧光蓝）：内存 / CPU / 磁盘读写 / 看门狗状态，带图标的程序列表，疑似内存泄漏告警，每个程序最近 24 小时的内存曲线；可以直接重启 / 结束程序、一键处理疑似泄漏、修复 NVIDIA 数据库、开关 Sonic Studio、安装看门狗 |
+| `MemMonitor.bat` / `MemMonitor.ps1` | **可视化监控窗口**（赛博朋克风格：红黑底 + 荧光蓝）：内存 / CPU / 磁盘读写 / 看门狗状态，带图标的程序列表，疑似内存泄漏告警，每个程序最近 24 小时的内存曲线；可以直接重启 / 结束程序、一键处理疑似泄漏、修复 NVIDIA 数据库、安装看门狗 |
 | `MemWatchdog.ps1` | **看门狗**：检查已知会泄漏的程序/服务，超过上限自动重启；同时记录历史数据给监控窗口用 |
 | `Install-Watchdog.ps1` | 把看门狗安装为计划任务（每 10 分钟 + 登录时运行）。加 `-Uninstall` 卸载 |
-| `SonicStudio.ps1` / `SonicStudio-On.bat` / `SonicStudio-Off.bat` | 一键开关华硕 Sonic Studio（Nahimic / A-Volute）。关闭时会释放 Windows 音频服务泄漏的内存 |
+| `extras/SonicStudio*.ps1/.bat` | （可选，仅华硕 Sonic Studio 用户）一键开关 Sonic Studio（Nahimic / A-Volute）。关闭时会释放 Windows 音频服务泄漏的内存 |
 | `Fix-NvTopps.ps1` | 修复 NVIDIA 显示容器（NVDisplay.Container）占用几个 GB 内存、持续读写硬盘的问题：重建膨胀的 `nvtopps.db3` 数据库 |
 
 ## 使用
