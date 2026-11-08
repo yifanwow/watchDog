@@ -83,7 +83,7 @@ namespace WatchDog
         const double HeavyIoMBs = 30;   // 单个程序读写超过这个速度会提示
         const int RingSize = 720;       // 每条实时数据最多 720 个点（5 秒一个 = 1 小时）
         const double GapSec = 1800;     // 实时数据中断超过 30 分钟，当作程序重启过，只看中断之后的数据
-        const int MaxSeries = 150;      // 最多同时记录 150 条
+        const int MaxSeries = 240;      // 最多同时记录 240 条（每个程序 内存 / CPU / 读写 各一条）
         const int MaxIcons = 150;
 
         // ---------- 状态（每次刷新都整体替换，不累积） ----------

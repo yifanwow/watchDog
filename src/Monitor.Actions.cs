@@ -97,7 +97,8 @@ namespace WatchDog
             foreach (ProcRow r in real.OrderByDescending(r => r.PrivMB).Take(40)) rec[r.Name] = r;
             foreach (Rule r in rules) if (r.Process != null && byName.ContainsKey(r.Process)) rec[r.Process] = byName[r.Process];
             if (selected != null && byName.ContainsKey(selected)) rec[selected] = byName[selected];
-            foreach (ProcRow r in rec.Values) Record(r.Name, r.PrivMB, nowU);
+            // 每个程序记三条：内存（键就是程序名）、CPU（cpu:程序名）、读写（io:程序名）
+            foreach (ProcRow r in rec.Values) { Record(r.Name, r.PrivMB, nowU); Record("cpu:" + r.Name, r.CpuPct, nowU); Record("io:" + r.Name, r.IoMBs, nowU); }
             EvalRules();
             SetMemExtra(memExtra, real.OrderByDescending(r => r.PrivMB).Take(3).Select(r => new KeyValuePair<string, double>(r.Name, r.PrivMB)).ToList());
             Dictionary<string, Rating> rts = new Dictionary<string, Rating>();

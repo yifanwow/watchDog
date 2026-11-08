@@ -6,7 +6,7 @@
 // 实时数据存在固定大小的环形缓存里（每条最多 1 小时 / 720 个点，最多 150 条），不会越用越大。
 //
 // 自测：WatchDog.exe --selftest --loops N [--report 文件] [--snapshot x.png] [--select 程序名]
-//        [--chart mem|cpu|disk|dog|proc] [--range 30m|1h|3h|12h|24h] [--sim 分钟] [--rising 程序名] [--data 目录]
+//        [--chart mem|cpu|disk|dog|proc] [--metric mem|cpu|io] [--range 30m|1h|3h|12h|24h] [--sim 分钟] [--rising 程序名] [--data 目录]
 //   在屏幕外显示窗口，连续刷新并完整重绘 N 次，记录自身内存 / GDI / 句柄，看有没有泄漏
 using System;
 using System.Collections.Generic;
@@ -96,7 +96,7 @@ namespace WatchDog
             StringBuilder outp = new StringBuilder();
             using (Monitor form = new Monitor(toolDir, dataDir, true, Get(a, "select", null), Get(a, "chart", "mem"), Get(a, "range", "30m")))
             {
-                form.Prepare(sim == 0);   // 用模拟数据时不读真实记录，也不存，免得混在一起
+                form.Prepare(sim == 0); form.SetMetric(Get(a, "metric", "mem"));   // 用模拟数据时不读真实记录，也不存，免得混在一起
                 Thread.Sleep(800);
                 // 在屏幕外真实显示窗口，让所有控件都按正常流程创建和绘制
                 form.StartPosition = FormStartPosition.Manual; form.Location = new Point(-5000, -5000); form.ShowInTaskbar = false;
@@ -138,6 +138,7 @@ namespace WatchDog
         public int IconCount { get { return icons.Count; } }
         public int SeriesCount { get { return series.Count; } }
         public void SaveLiveNow() { SaveLive(); }
+        public void SetMetric(string m) { procMetric = m; }
         public void ForceClose() { reallyExit = true; Close(); }
 
         // 仅自测：预先填入最近 N 分钟的模拟实时数据
@@ -149,7 +150,7 @@ namespace WatchDog
             for (int i = 0; i < n; i++)
             {
                 DateTime t = t0.AddSeconds(i * 5); double f = i / (double)Math.Max(1, n - 1);
-                foreach (ProcRow r in rows0) Record(r.Name, r.Name == rising ? r.PrivMB - 250 * (1 - f) : r.PrivMB * (1 + (rnd.NextDouble() - 0.5) * 0.02), t);
+                foreach (ProcRow r in rows0) { Record(r.Name, r.Name == rising ? r.PrivMB - 250 * (1 - f) : r.PrivMB * (1 + (rnd.NextDouble() - 0.5) * 0.02), t); Record("cpu:" + r.Name, rnd.NextDouble() * 8, t); Record("io:" + r.Name, Math.Max(0, rnd.NextDouble() * 3 - 2), t); }
                 Record("sys:mem", 19 + f + rnd.NextDouble() * 0.3, t); Record("sys:cpu", 20 + 15 * Math.Sin(i / 20.0) + rnd.NextDouble() * 8, t);
                 Record("sys:dr", Math.Max(0, rnd.NextDouble() * 3 - 1), t); Record("sys:dw", Math.Max(0, rnd.NextDouble() * 6 - 2 + (i % 90 < 5 ? 40 : 0)), t);
                 Record("sys:self", 40 + rnd.NextDouble() * 4, t);

@@ -16,7 +16,7 @@ namespace WatchDog
         public List<KeyValuePair<string, double>> Top = new List<KeyValuePair<string, double>>();   // 内存卡片右侧：占用最多的程序
     }
     class Line { public long[] T; public double[] V; public int Level; public string Name; public PointF? LastPt; }
-    class ChartData { public string Title = "", Unit = "", Note = ""; public double FixedMax; public List<Line> Lines = new List<Line>(); }
+    class ChartData { public string Title = "", Unit = "", Note = "", Msg; public double FixedMax; public bool Zero; public List<Line> Lines = new List<Line>(); }
 
     partial class Monitor : Form
     {
@@ -134,6 +134,9 @@ namespace WatchDog
         FormWindowState lastState = FormWindowState.Normal;
         List<object[]> issueRects = new List<object[]>();   // [y0, y1, target, key, title, bx1, bx2]
         List<object[]> rangeRects = new List<object[]>();   // [x0, x1, key]
+        List<object[]> metricRects = new List<object[]>();  // [x0, x1, mem|cpu|io]
+        string procMetric = "mem";                           // 选中程序时走势图看哪一项
+        static readonly string[][] ProcMetrics = { new[] { "mem", "内存" }, new[] { "cpu", "CPU" }, new[] { "io", "读写" } };
 
         // 走势图可选的时间范围（小时）。默认近 30 分钟
         static readonly string[] RangeKeys = { "30m", "1h", "3h", "12h", "24h" };
@@ -371,7 +374,7 @@ namespace WatchDog
                 g.FillRectangle(bDimLine, 14, y, w - 28, 1);
                 Txt(g, "// LOG 最近的后台检查", fSmall, cAccent, 14, y + 4, w - 28, 14);
                 y += 22;
-                for (int i = sys.Count - 1; i >= 0 && y + 16 < h - 10; i--, y += 17)
+                for (int i = sys.Count - 1; i >= Math.Max(0, sys.Count - 5) && y + 16 < h - 10; i--, y += 17)
                 {
                     SysRow r = sys[i];
                     Txt(g, r.T.ToString("MM-dd HH:mm"), fMono, cRedDim, 16, y, 84, 16);
@@ -496,12 +499,22 @@ namespace WatchDog
                 g.FillRectangle(bBg, r);
                 g.FillRectangle(bAcc, r.X, r.Bottom - 2, r.Width, 2);
                 bool sorted = SortCol[sortMode] == e.ColumnIndex;
-                Txt(g, sorted ? e.Header.Text + " ▼" : e.Header.Text, fCNb, sorted ? cCyan : cAccent, r.X + 8, r.Y, r.Width - 16, r.Height, RightCols.Contains(e.ColumnIndex) ? tfR : tfL);
+                if (sorted)
+                {
+                    // 当前排序的列：荧光蓝文字 + 底部荧光蓝条 + 左边小三角（不占文字位置，窄列也不会被截断）
+                    g.FillRectangle(bLv[0], r.X, r.Bottom - 3, r.Width, 3);
+                    float cy = r.Y + r.Height / 2f;
+                    g.FillPolygon(bLv[0], new[] { new PointF(r.X + 3, cy - 3), new PointF(r.X + 11, cy - 3), new PointF(r.X + 7, cy + 2) });
+                }
+                Txt(g, e.Header.Text, fCNb, sorted ? cCyan : cAccent, r.X + (sorted ? 13 : 8), r.Y, r.Width - (sorted ? 19 : 16), r.Height, RightCols.Contains(e.ColumnIndex) ? tfR : tfL);
             };
             lv.ColumnClick += delegate(object s, ColumnClickEventArgs e)
             {
                 sortMode = e.Column == 2 ? "mem" : e.Column == 3 ? "cpu" : e.Column == 4 ? "io" : "issue";
                 RefreshAll(); lv.Invalidate();
+                // 列标题是单独的子窗口，lv.Invalidate() 不会重画它，旧的排序标记会留着：手动让它整个重画
+                IntPtr hdr = Native.SendMessage(lv.Handle, 0x101F, IntPtr.Zero, IntPtr.Zero);   // LVM_GETHEADER
+                if (hdr != IntPtr.Zero) Native.InvalidateRect(hdr, IntPtr.Zero, true);
             };
             lv.DrawItem += delegate { };
             lv.DrawSubItem += DrawSubItem;
@@ -598,7 +611,17 @@ namespace WatchDog
                 default:
                     if (selected == null) { d.Note = "点选列表里的程序看它的内存走势；点上面的卡片看整机内存 / CPU / 磁盘 / 看门狗"; break; }
                     string desc = DescOf(selected) ?? "-";
-                    d.Title = selected + "  ·  " + desc; d.Unit = "MB"; d.Note = lng ? rec : live;
+                    d.Title = selected + "  ·  " + desc; d.Note = lng ? rec : live;
+                    if (procMetric == "cpu" || procMetric == "io")
+                    {
+                        // 看门狗的记录里每个程序只有内存，CPU / 读写只有窗口的实时数据
+                        bool cpu = procMetric == "cpu";
+                        d.Unit = cpu ? "%" : "MB/s"; d.Zero = true; d.Note = live;
+                        if (lng) d.Msg = "看门狗的记录里每个程序只记了内存；程序的 CPU 和读写只有窗口的实时数据，请选\"30 分钟\"或\"1 小时\"。";
+                        else d.Lines.Add(RingLine((cpu ? "cpu:" : "io:") + selected, 0, cpu ? "CPU" : "读写"));
+                        break;
+                    }
+                    d.Unit = "MB";
                     List<HistPt> hl; hist.TryGetValue(selected, out hl);
                     d.Lines.Add(lng ? HistLine(hl, x => x.T, x => x.MB, 0, "内存") : RingLine(selected, 0, "内存"));
                     break;
@@ -623,7 +646,22 @@ namespace WatchDog
             int rw = 64, gap = 4;
             int x = w - 24 - RangeKeys.Length * (rw + gap) + gap;
             Txt(g, "近", fCN, cGray, x - 26, 7, 22, 20, tfR);
-            Txt(g, data.Title, fCNb, cText, 84, 8, x - 84 - 34, 20);
+            int titleEnd = x - 34;
+            // 选中程序时：内存 / CPU / 读写 切换
+            List<object[]> mrects = new List<object[]>();
+            if (chartMode == "proc" && selected != null)
+            {
+                int mw = 48, mx = x - 40 - ProcMetrics.Length * (mw + 4);
+                foreach (string[] m in ProcMetrics)
+                {
+                    if (procMetric == m[0]) { g.FillRectangle(bAcc, mx, 7, mw, 20); Txt(g, m[1], fCNb, cBg, mx, 7, mw, 20, tfC); }
+                    else { g.DrawRectangle(pAccDim, mx, 7, mw, 20); Txt(g, m[1], fCN, cAccent, mx, 7, mw, 20, tfC); }
+                    mrects.Add(new object[] { mx, mx + mw, m[0] }); mx += mw + 4;
+                }
+                titleEnd = x - 40 - ProcMetrics.Length * (mw + 4) - 10;
+            }
+            metricRects = mrects;
+            Txt(g, data.Title, fCNb, cText, 84, 8, titleEnd - 84, 20);
             List<object[]> rects = new List<object[]>();
             foreach (string key in RangeKeys)
             {
@@ -640,7 +678,7 @@ namespace WatchDog
             Txt(g, data.Note, fCN, cGray, 14, h - 22, w - 200, 16);
             if (lines.Count == 0)
             {
-                string msg = chartMode == "proc" && selected == null ? data.Note
+                string msg = data.Msg != null ? data.Msg : chartMode == "proc" && selected == null ? data.Note
                     : RangeHours[range] <= 1 ? "实时数据还不够：窗口每 5 秒记录一个点，稍等片刻；或者选\"3 小时\"以上，看看门狗的记录。"
                     : "这段时间还没有看门狗的记录（每 10 分钟记录一次）。可以先看\"30 分钟 / 1 小时\"的实时数据，或者选更长的时间。";
                 Txt(g, msg, fCN, cGray, 14, 44, w - 28, 40, tfW);
@@ -651,6 +689,7 @@ namespace WatchDog
             if (min == double.MaxValue) min = 0;
             double lo, hi;
             if (data.FixedMax > 0) { lo = 0; hi = data.FixedMax; }
+            else if (data.Zero) { lo = 0; hi = Math.Max(max * 1.15, 1); }
             else { double pad = Math.Max((max - min) * 0.15, Math.Max(max * 0.02, 0.5)); lo = Math.Max(0, min - pad); hi = max + pad; }
             string fmt = hi - lo < 10 ? "{0:N1}" : "{0:N0}";   // 范围小时多显示一位小数，免得刻度重复
             for (int i = 0; i <= 3; i++)
@@ -707,6 +746,8 @@ namespace WatchDog
         void ChartClick(object s, MouseEventArgs e)
         {
             if (e.Y < 4 || e.Y > 30) return;
+            foreach (object[] r in metricRects)
+                if (e.X >= (int)r[0] && e.X < (int)r[1]) { procMetric = (string)r[2]; chart.Invalidate(); return; }
             foreach (object[] r in rangeRects)
                 if (e.X >= (int)r[0] && e.X < (int)r[1]) { chartRange = (string)r[2]; chart.Invalidate(); break; }
         }
