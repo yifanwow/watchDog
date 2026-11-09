@@ -8,30 +8,34 @@ $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path $csc)) { $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe' }
 if (-not (Test-Path $csc)) { Write-Host 'csc.exe (.NET Framework 4) not found'; exit 1 }
 
-# ---- Icon: red-black tile, coral cut-corner frame, neon cyan "W" (PNG images packed into an .ico) ----
+# ---- Icon: the dog logo from watchdog.yifanovo.com (favicon.svg, 64x64 units), PNG images packed into an .ico ----
 function New-IconPng([int]$s) {
     $bmp = New-Object Drawing.Bitmap($s, $s)
     $g = [Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'AntiAliasGridFit'
-    $c = [single]($s * 0.22); $m = [single]([math]::Max(1, $s * 0.04))
-    $pts = [Drawing.PointF[]]@(
-        (New-Object Drawing.PointF($m, $m)), (New-Object Drawing.PointF(($s - $m - $c), $m)),
-        (New-Object Drawing.PointF(($s - $m), ($m + $c))), (New-Object Drawing.PointF(($s - $m), ($s - $m))),
-        (New-Object Drawing.PointF(($m + $c / 2), ($s - $m))), (New-Object Drawing.PointF($m, ($s - $m - $c / 2))))
-    $bg = New-Object Drawing.SolidBrush([Drawing.Color]::FromArgb(32, 13, 17))
-    $pen = New-Object Drawing.Pen([Drawing.Color]::FromArgb(255, 95, 87), [single]([math]::Max(1, $s * 0.05)))
-    $cyan = New-Object Drawing.SolidBrush([Drawing.Color]::FromArgb(94, 246, 255))
-    $red = New-Object Drawing.SolidBrush([Drawing.Color]::FromArgb(255, 40, 60))
-    $font = New-Object Drawing.Font('Bahnschrift SemiBold', [single]($s * 0.52), [Drawing.FontStyle]::Bold, [Drawing.GraphicsUnit]::Pixel)
-    $fmt = New-Object Drawing.StringFormat; $fmt.Alignment = 'Center'; $fmt.LineAlignment = 'Center'
+    $g.SmoothingMode = 'AntiAlias'
+    $k = $s / 64.0
+    $g.ScaleTransform([single]$k, [single]$k)
+    # small sizes: thicker lines so the shape stays readable (at least ~1.3 px)
+    $wr = [single][math]::Max(3.2, 1.3 / $k); $wc = [single][math]::Max(3.0, 1.3 / $k)
+    $bg = New-Object Drawing.SolidBrush([Drawing.Color]::FromArgb(11, 14, 19))
+    $red = New-Object Drawing.Pen([Drawing.Color]::FromArgb(250, 76, 89), $wr)
+    $cyan = New-Object Drawing.Pen([Drawing.Color]::FromArgb(150, 250, 255), $wc)
+    $red.LineJoin = 'Bevel'; $cyan.LineJoin = 'Bevel'
+    $path = New-Object Drawing.Drawing2D.GraphicsPath
+    function P($x, $y) { New-Object Drawing.PointF([single]$x, [single]$y) }
     try {
-        $g.FillPolygon($bg, $pts); $g.DrawPolygon($pen, $pts)
-        $g.DrawString('W', $font, $cyan, (New-Object Drawing.RectangleF(0, [single]($s * 0.02), $s, $s)), $fmt)
-        if ($s -ge 32) { $d = [single]($s * 0.12); $g.FillRectangle($red, [single]($s * 0.14), [single]($s * 0.14), $d, $d) }
+        $r = 22   # corner radius 11
+        $path.AddArc(0, 0, $r, $r, 180, 90); $path.AddArc(64 - $r, 0, $r, $r, 270, 90)
+        $path.AddArc(64 - $r, 64 - $r, $r, $r, 0, 90); $path.AddArc(0, 64 - $r, $r, $r, 90, 90); $path.CloseFigure()
+        $g.FillPath($bg, $path)
+        $g.DrawPolygon($red, [Drawing.PointF[]]@((P 10 26), (P 10 10), (P 24 20), (P 40 20), (P 54 10), (P 54 26), (P 47 51), (P 17 51)))
+        $g.DrawLines($cyan, [Drawing.PointF[]]@((P 21 33), (P 31 38), (P 21 42)))
+        $g.DrawLines($cyan, [Drawing.PointF[]]@((P 43 33), (P 33 38), (P 43 42)))
+        $g.DrawLine($cyan, (P 30 48), (P 34 48))
         $ms = New-Object IO.MemoryStream
         $bmp.Save($ms, [Drawing.Imaging.ImageFormat]::Png)
         , $ms.ToArray()
-    } finally { $g.Dispose(); $bmp.Dispose(); $bg.Dispose(); $pen.Dispose(); $cyan.Dispose(); $red.Dispose(); $font.Dispose(); $fmt.Dispose() }
+    } finally { $g.Dispose(); $bmp.Dispose(); $bg.Dispose(); $red.Dispose(); $cyan.Dispose(); $path.Dispose() }
 }
 $sizes = 256, 48, 32, 16
 $pngs = @(foreach ($s in $sizes) { , (New-IconPng $s) })
