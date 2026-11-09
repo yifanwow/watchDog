@@ -13,3 +13,5 @@ ignore.json
 notes.json
 profile.json
 avatar.png
+# Download packages built by Build-Release.ps1
+release/
