@@ -117,7 +117,7 @@ namespace WatchDog
         // ---------- 控件 ----------
         BufferedPanel header, cards, diag, detail, actions, chart, status;
         Panel side;
-        BufferedPanel cardMem, cardCpu, cardDisk;
+        BufferedPanel cardMem, cardCpu, cardDisk, cardKernel;
         BufferedPanel[] cardList;
         CardData dog = new CardData { Tag = "WATCHDOG", Title = "看门狗", Mode = "dog" };   // 画在体检结论的上半部分
         const int DogY = 34, DogH = 88;
@@ -138,20 +138,23 @@ namespace WatchDog
         List<object[]> metricRects = new List<object[]>();  // [x0, x1, mem|cpu|io]
         string procMetric = "mem";
         bool memPct;                                         // 整机内存走势上是否显示黄色百分比线                           // 选中程序时走势图看哪一项
-        static readonly string[][] ProcMetrics = { new[] { "mem", "内存" }, new[] { "cpu", "CPU" }, new[] { "io", "读写" } };
+        static readonly string[][] ProcMetrics = { new[] { "mem", "内存" }, new[] { "cpu", "CPU" }, new[] { "io", "读写" }, new[] { "hnd", "句柄" }, new[] { "gui", "GDI" } };
+        string kernelMetric = "pool";                        // 内核走势图看内存池还是句柄总数
+        static readonly string[][] KernelMetrics = { new[] { "pool", "内存池" }, new[] { "total", "句柄" } };
 
         // 走势图可选的时间范围（小时）。默认近 30 分钟
         static readonly string[] RangeKeys = { "30m", "1h", "3h", "12h", "24h" };
         static readonly Dictionary<string, double> RangeHours = new Dictionary<string, double> { { "30m", 0.5 }, { "1h", 1 }, { "3h", 3 }, { "12h", 12 }, { "24h", 24 } };
         static readonly Dictionary<string, string> RangeLabel = new Dictionary<string, string> { { "30m", "30 分钟" }, { "1h", "1 小时" }, { "3h", "3 小时" }, { "12h", "12 小时" }, { "24h", "24 小时" } };
-        static readonly int[] RightCols = { 2, 3, 4 };
-        static readonly Dictionary<string, int> SortCol = new Dictionary<string, int> { { "mem", 2 }, { "cpu", 3 }, { "io", 4 }, { "issue", 5 } };
+        const int ColCount = 10;
+        static readonly int[] RightCols = { 2, 3, 4, 5, 6 };
+        static readonly Dictionary<string, int> SortCol = new Dictionary<string, int> { { "mem", 2 }, { "cpu", 3 }, { "io", 4 }, { "hnd", 5 }, { "gui", 6 }, { "issue", 7 } };
 
         void BuildUI()
         {
             Text = "WATCHDOG // 内存 · CPU · 磁盘 监控";
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;   // 屏幕够高就开高一点，右侧栏更宽松
-            Size = new Size(Math.Min(1340, wa.Width), Math.Max(920, Math.Min(1060, wa.Height))); MinimumSize = new Size(1150, 920);
+            Size = new Size(Math.Min(1480, wa.Width), Math.Max(920, Math.Min(1060, wa.Height))); MinimumSize = new Size(1150, 920);
             StartPosition = FormStartPosition.CenterScreen;
             Font = fCN; BackColor = cBg; ForeColor = cText;
             try { formIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); Icon = formIcon; } catch { }
@@ -167,18 +170,20 @@ namespace WatchDog
             header.MouseLeave += delegate { if (hoverLink != null) { hoverLink = null; header.Cursor = Cursors.Default; header.Invalidate(); } };
             header.MouseClick += delegate(object s, MouseEventArgs e) { string url = LinkAt(e.Location); if (url != null) StartShell(url, ""); };
 
-            // 三张卡片（点击切换下方走势图）：内存占一半宽，CPU、磁盘各四分之一
+            // 四张卡片（点击切换下方走势图）：内存最宽，CPU、磁盘、内核平分剩下的
             cards = new BufferedPanel(); cards.Dock = DockStyle.Top; cards.Height = 136; cards.BackColor = cBg;
             cardMem = NewCard("MEMORY", "内存", "MEM-01 // 0x4D45", "mem");
             cardCpu = NewCard("CPU", "处理器", "CPU-02 // 0x4350", "cpu");
             cardDisk = NewCard("DISK", "磁盘", "DSK-03 // 0x4453", "disk");
-            cardList = new[] { cardMem, cardCpu, cardDisk };
+            cardKernel = NewCard("KERNEL", "内核", "KRN-06 // 0x4B52", "kernel");
+            cardList = new[] { cardMem, cardCpu, cardDisk, cardKernel };
             cards.Resize += delegate
             {
-                int all = cards.ClientSize.Width - 24, wm = all / 2, ws = (all - wm) / 2;
+                int all = cards.ClientSize.Width - 36, wm = (int)(all * 0.4), ws = (all - wm) / 3;
                 cardMem.SetBounds(0, 0, wm, 136);
                 cardCpu.SetBounds(wm + 12, 0, ws, 136);
-                cardDisk.SetBounds(wm + 24 + ws, 0, cards.ClientSize.Width - (wm + 24 + ws), 136);
+                cardDisk.SetBounds(wm + 24 + ws, 0, ws, 136);
+                cardKernel.SetBounds(wm + 36 + 2 * ws, 0, cards.ClientSize.Width - (wm + 36 + 2 * ws), 136);
             };
 
             // 右侧栏（从标题条一直到底）：当前用户 / 体检结论（含看门狗，按内容定高度）/ 选中程序（占剩下的）/ 操作。不会出现滚动条
@@ -316,10 +321,11 @@ namespace WatchDog
             int li = Lx(d.Level);
             bool big = d.Mode == "mem";
             Txt(g, active ? "▼ 走势显示中" : d.Code, fSmall, active ? cCyan : cRedDim, w - 160, h - 17, 148, 14, tfR);
-            if (!string.IsNullOrEmpty(d.Badge)) { int bwid = big ? 104 : 84; Badge(g, d.Badge, li, w - bwid - 14, 10, bwid, 22); }
-            // 大卡片（内存）：左边数值 + 进度条，右边"占用最多"
+            if (!string.IsNullOrEmpty(d.Badge)) { int bwid = big ? 104 : w < 230 ? 72 : 84; Badge(g, d.Badge, li, w - bwid - 14, 10, bwid, 22); }
+            // 大卡片（内存）：左边数值 + 进度条，右边"占用最多"。窗口窄时数值换小一号字
             int lw = big ? (int)(w * 0.54) : w;
-            Txt(g, d.Value, big ? fNumBig : fNumS, cCyan, 10, big ? 30 : 36, lw - 20, big ? 44 : 32);
+            bool bigNum = big && lw >= 215;
+            Txt(g, d.Value, bigNum ? fNumBig : fNumS, cCyan, 10, bigNum ? 30 : 36, lw - 20, bigNum ? 44 : 32);
             if (d.Pct >= 0)
             {
                 int n = big ? 30 : 16; float gap = 3, bw = (lw - 24 - gap * (n - 1)) / n;
@@ -327,7 +333,7 @@ namespace WatchDog
                 for (int i = 0; i < n; i++) g.FillRectangle(i < on ? bLv[li] : bDim, 12 + i * (bw + gap), 76, bw, 8);
             }
             Txt(g, d.Sub, fCN, cGray, 12, 90, lw - 24, 20);
-            if (big && d.Extra.Length > 0) Txt(g, d.Extra, fCN, cGray, 12, 108, lw - 24, 18);
+            if (d.Extra.Length > 0) Txt(g, d.Extra, fCN, cGray, 12, 108, lw - 24, 18);
             if (big && d.Top.Count > 0)
             {
                 int x0 = lw + 4, tw = w - x0 - 16;
@@ -361,6 +367,11 @@ namespace WatchDog
             string a = string.Join("|", d.Top.Select(t => t.Key + ((int)t.Value))), b = string.Join("|", top.Select(t => t.Key + ((int)t.Value)));
             if (a == b && d.Extra == extra) return;
             d.Top = top; d.Extra = extra; cardMem.Invalidate();
+        }
+        void SetCardExtra(BufferedPanel card, string extra)
+        {
+            CardData d = (CardData)card.Tag;
+            if (d.Extra != extra) { d.Extra = extra; card.Invalidate(); }
         }
         void SetDog(string value, string badge, int level, string sub, double pct)
         {
@@ -467,6 +478,7 @@ namespace WatchDog
         void DiagClick(object s, MouseEventArgs e)
         {
             if (e.Y >= DogY && e.Y < DogY + DogH) { SetChartMode("dog"); return; }
+            // 内核问题没有对应的程序：点它切到内核走势图
             foreach (object[] r in issueRects)
             {
                 int y0 = (int)r[0], y1 = (int)r[1]; string key = (string)r[3], title = (string)r[4];
@@ -479,7 +491,12 @@ namespace WatchDog
                 }
             }
             foreach (object[] r in issueRects)
-                if (e.Y >= (int)r[0] && e.Y < (int)r[1] && r[2] != null) { SelectTarget((string)r[2]); break; }
+                if (e.Y >= (int)r[0] && e.Y < (int)r[1])
+                {
+                    if (r[2] != null) SelectTarget((string)r[2]);
+                    else if ((string)r[3] == "kernel") { kernelMetric = "pool"; SetChartMode("kernel"); }
+                    break;
+                }
         }
 
         // ---------- 选中的程序 ----------
@@ -498,16 +515,21 @@ namespace WatchDog
             if (icon != null) { g.InterpolationMode = InterpolationMode.HighQualityBicubic; g.DrawImage(icon, 14, 38, 32, 32); }
             else { g.FillRectangle(bDim, 14, 38, 32, 32); g.DrawRectangle(pAcc, 14, 38, 32, 32); }
             Txt(g, name, fCNbig, cCyan, 56, 36, w - 70, 22);
-            string sub = (HasNote(name) ? "✎ " : "") + (DescOf(name) ?? "-");
+            string sub = (HasNote(name) ? "✎ " : "") + (DescOf(name) ?? "-") + (r.Count > 1 ? " · " + r.Count + " 个进程" : "");
             Rule wr;
             if (watched.TryGetValue(name, out wr)) sub += string.Format("  ·  ◉ 看门狗监控中（超过 {0} MB {1}）", wr.MinMB, wr.Auto ? "自动重启" : "提醒");
             Txt(g, sub, fCN, cGray, 56, 58, w - 70, 18);
-            string[,] cols = { { "内存", string.Format("{0:N0} MB", r.PrivMB) }, { "CPU", string.Format("{0:N1} %", r.CpuPct) }, { "读写", string.Format("{0:N1} MB/s", r.IoMBs) }, { "进程", r.Count.ToString() } };
-            float cw = (w - 28) / 4f;
-            for (int i = 0; i < 4; i++)
+            Issue ri; resIssues.TryGetValue(name, out ri);
+            string[,] cols = { { "内存", string.Format("{0:N0} MB", r.PrivMB) }, { "CPU", string.Format("{0:N1}%", r.CpuPct) }, { "读写", string.Format("{0:N1} MB/s", r.IoMBs) },
+                { "句柄", string.Format("{0:N0}", r.Handles) }, { "GDI/USER", r.Gdi + "/" + r.User } };
+            float[] cw = { 0.22f, 0.15f, 0.22f, 0.17f, 0.24f };
+            float cx = 14;
+            for (int i = 0; i < 5; i++)
             {
-                Txt(g, cols[i, 0], fCN, cGray, 14 + i * cw, 80, cw, 16);
-                Txt(g, cols[i, 1], fTagB, cText, 14 + i * cw, 96, cw, 20);
+                float ww = (w - 28) * cw[i];
+                Txt(g, cols[i, 0], fCN, cGray, cx, 80, ww, 16);
+                Txt(g, cols[i, 1], fTagB, i >= 3 && ri != null ? LevelColor(ri.Level) : cText, cx, 96, ww, 20);
+                cx += ww;
             }
             Rating rt = GetRating(name, r.PrivMB);
             Txt(g, "稳定性：" + rt.Text, fCNb, LevelColor(rt.Level), 14, 122, 130, 18);
@@ -518,9 +540,17 @@ namespace WatchDog
                 Txt(g, "已知问题：" + hit.Rule.Title, fCNb, LevelColor(rt.Level), 14, 144, w - 28, 18);
                 Txt(g, hit.Why + "。" + hit.Rule.Cause, fCN, cGray, 14, 164, w - 28, Math.Max(18, h - 48 - 164), tfW);
             }
+            else if (ri != null)
+            {
+                // 句柄 / 图形资源问题
+                Txt(g, ShortTitle(ri, name), fCNb, LevelColor(ri.Level), 14, 144, w - 28, 18);
+                // 空间够才显示说明（够两行就折行），不然会压到下面的按钮；体检结论里有完整说明
+                int room = h - 50 - 164;
+                if (room >= 18) Txt(g, ri.Sub, fCN, cGray, 14, 164, w - 28, room >= 60 ? 36 : 18, room >= 60 ? tfW : tfL);
+            }
             else if (rt.Forecast.Length > 0) Txt(g, rt.Forecast, fCNb, LevelColor(rt.Level), 14, 144, w - 28, 18);
             // 剩下的空间：近 30 分钟的小走势 + 统计
-            int top = hit != null ? 200 : rt.Forecast.Length > 0 ? 170 : 148, bottom = h - 50;
+            int top = hit != null ? 200 : ri != null ? (h - 50 - 164 >= 60 ? 204 : 186) : rt.Forecast.Length > 0 ? 170 : 148, bottom = h - 50;
             if (bottom - top >= 40) PaintMini(g, name, 14, top, w - 28, bottom - top);
         }
         void PaintMini(Graphics g, string name, int x, int y, int w, int h)
@@ -548,6 +578,18 @@ namespace WatchDog
             g.DrawLines(pPulseGlow, arr); g.DrawLines(pPulse, arr);
             g.FillRectangle(bLv[0], arr[arr.Length - 1].X - 2, arr[arr.Length - 1].Y - 2, 4, 4);
         }
+        // 内核走势图下面的说明：有问题时给处理办法，平时列出占用最多 / 涨得最多的标签
+        // 句柄 / 图形资源问题去掉程序名后的简短说明（列表和右侧栏里程序名已经显示了）
+        static string ShortTitle(Issue i, string name) { return i.Title.Replace(name, "").Trim().TrimStart('的').Trim(); }
+        string KernelNote()
+        {
+            TagStat grow = poolGrow.FirstOrDefault();
+            string g = grow != null ? string.Format("窗口打开后涨最多：{0} +{1:N0} MB", TagLabel(grow), grow.GrowMB) : "";
+            if (kernelIssue != null)
+                return "处理：更新或回退最近装 / 更新过的驱动（显卡、网卡、杀毒、灯效、外设），重启电脑可以立即收回" + (g.Length > 0 ? " · " + g : "");
+            string big = string.Join("，", poolBig.Select(t => string.Format("{0} {1:N0} MB", TagLabel(t), t.MB)));
+            return (big.Length > 0 ? "占用最多：" + big : "每个驱动申请内存时带一个 4 字母标签，10 分钟后显示明细") + (g.Length > 0 ? " · " + g : "");
+        }
         static double Avg(Ring r, long from)
         {
             if (r == null) return 0;
@@ -563,7 +605,7 @@ namespace WatchDog
             lv.Dock = DockStyle.Fill; lv.View = View.Details; lv.FullRowSelect = true; lv.HideSelection = false; lv.MultiSelect = false;
             lv.OwnerDraw = true; lv.BackColor = cRowA; lv.ForeColor = cText; lv.BorderStyle = BorderStyle.None;
             rowH = new ImageList(); rowH.ImageSize = new Size(1, 28); lv.SmallImageList = rowH;
-            object[,] cols = { { "程序", 175 }, { "说明", 140 }, { "内存 MB", 80 }, { "CPU %", 58 }, { "读写 MB/s", 78 }, { "稳定性", 78 }, { "变化", 135 }, { "判断 / 预测", 180 } };
+            object[,] cols = { { "程序", 160 }, { "说明", 112 }, { "内存 MB", 76 }, { "CPU %", 56 }, { "读写 MB/s", 74 }, { "句柄", 62 }, { "GDI/USER", 82 }, { "稳定性", 74 }, { "变化", 112 }, { "判断 / 预测", 170 } };
             for (int i = 0; i < cols.GetLength(0); i++) lv.Columns.Add((string)cols[i, 0], (int)cols[i, 1]);
             lv.DrawColumnHeader += delegate(object s, DrawListViewColumnHeaderEventArgs e)
             {
@@ -582,7 +624,7 @@ namespace WatchDog
             };
             lv.ColumnClick += delegate(object s, ColumnClickEventArgs e)
             {
-                sortMode = e.Column == 2 ? "mem" : e.Column == 3 ? "cpu" : e.Column == 4 ? "io" : "issue";
+                sortMode = e.Column == 2 ? "mem" : e.Column == 3 ? "cpu" : e.Column == 4 ? "io" : e.Column == 5 ? "hnd" : e.Column == 6 ? "gui" : "issue";
                 RefreshAll(); lv.Invalidate();
                 // 列标题是单独的子窗口，lv.Invalidate() 不会重画它，旧的排序标记会留着：手动让它整个重画
                 IntPtr hdr = Native.SendMessage(lv.Handle, 0x101F, IntPtr.Zero, IntPtr.Zero);   // LVM_GETHEADER
@@ -624,8 +666,10 @@ namespace WatchDog
                 return;
             }
             double io; double.TryParse(it.SubItems[4].Text, out io);
-            Color c = col == 1 ? (HasNote(it.Text) ? cText : cGray) : col == 6 ? cGray : col == 4 ? (io >= HeavyIoMBs ? cYellow : cText) : col == 5 ? LevelColor(lvl) : col == 7 ? (lvl >= 1 ? LevelColor(lvl) : cGray) : cText;
-            Txt(g, e.SubItem.Text, col == 5 ? fCNb : fCN, c, r.X + 8, r.Y, r.Width - 16, r.Height, RightCols.Contains(col) ? tfR : tfL);
+            int rl = ResLevel(it.Text); Rating mr; int ml = ratings.TryGetValue(it.Text, out mr) ? mr.Level : -1;   // 稳定性一栏只看内存
+            Color c = col == 1 ? (HasNote(it.Text) ? cText : cGray) : col == 8 ? cGray : col == 4 ? (io >= HeavyIoMBs ? cYellow : cText)
+                : col == 5 || col == 6 ? (rl >= 1 ? LevelColor(rl) : cGray) : col == 7 ? LevelColor(ml) : col == 9 ? (lvl >= 1 ? LevelColor(lvl) : cGray) : cText;
+            Txt(g, e.SubItem.Text, col == 7 ? fCNb : fCN, c, r.X + 8, r.Y, r.Width - 16, r.Height, RightCols.Contains(col) ? tfR : tfL);
         }
         void FitColumns()
         {
@@ -687,10 +731,41 @@ namespace WatchDog
                     if (lng) { d.Title = "看门狗每次检查耗时"; d.Unit = "秒"; d.Lines.Add(HistLine(sys, x => x.T, x => x.RunMs / 1000, 0, "耗时")); }
                     else { d.Title = "本监控窗口自身内存"; d.Unit = "MB"; d.Lines.Add(RingLine("sys:self", 0, "本窗口")); }
                     break;
+                case "kernel":
+                    {
+                        List<SysRow> k = sys.Where(x => x.HasKernel).ToList();
+                        if (lng && k.Count < 2) d.Msg = "看门狗从这个版本才开始记录内核内存和句柄总数（每 10 分钟一次），过一段时间就有了；可以先看\"30 分钟 / 1 小时\"的实时数据。";
+                        if (kernelMetric == "total")
+                        {
+                            d.Title = "全系统句柄总数"; d.Unit = "万"; d.Note = lng ? rec : live;
+                            Line hl2 = lng ? HistLine(k, x => x.T, x => x.Handles / 10000, 0, "句柄") : RingLine("sys:hnd", 0, "句柄");
+                            if (!lng && hl2 != null) for (int i = 0; i < hl2.V.Length; i++) hl2.V[i] /= 10000;
+                            d.Lines.Add(hl2);
+                            break;
+                        }
+                        d.Title = "内核内存池（驱动用的内存）"; d.Unit = "MB"; d.Note = KernelNote();
+                        d.Lines.Add(lng ? HistLine(k, x => x.T, x => x.PoolP, 0, "分页池") : RingLine("sys:kp", 0, "分页池"));
+                        d.Lines.Add(lng ? HistLine(k, x => x.T, x => x.PoolN, 1, "非分页池") : RingLine("sys:kn", 1, "非分页池"));
+                        break;
+                    }
                 default:
-                    if (selected == null) { d.Note = "点选列表里的程序看它的内存走势；点上面的卡片看整机内存 / CPU / 磁盘 / 看门狗"; break; }
+                    if (selected == null) { d.Note = "点选列表里的程序看它的内存走势；点上面的卡片看整机内存 / CPU / 磁盘 / 内核 / 看门狗"; break; }
                     string desc = DescOf(selected) ?? "-";
                     d.Title = selected + "  ·  " + desc; d.Note = lng ? rec : live;
+                    if (procMetric == "hnd")
+                    {
+                        d.Unit = "个"; List<HistPt> hh; histH.TryGetValue(selected, out hh);
+                        if (lng && (hh == null || hh.Count < 2)) d.Msg = "看门狗只记录内存前 30 和句柄最多的 10 个程序的句柄数（从这个版本开始），这个程序还没有长期记录；请选\"30 分钟\"或\"1 小时\"。";
+                        d.Lines.Add(lng ? HistLine(hh, x => x.T, x => x.MB, 0, "句柄") : RingLine("hnd:" + selected, 0, "句柄"));
+                        break;
+                    }
+                    if (procMetric == "gui")
+                    {
+                        d.Unit = "个"; d.Note = live + " · GDI / USER 单个进程上限各 1 万个";
+                        if (lng) d.Msg = "看门狗的记录里没有 GDI / USER（要额外开销），只有窗口的实时数据，请选\"30 分钟\"或\"1 小时\"。";
+                        else { d.Lines.Add(RingLine("gdi:" + selected, 0, "GDI")); d.Lines.Add(RingLine("usr:" + selected, 1, "USER")); }
+                        break;
+                    }
                     if (procMetric == "cpu" || procMetric == "io")
                     {
                         // 看门狗的记录里每个程序只有内存，CPU / 读写只有窗口的实时数据
@@ -736,16 +811,18 @@ namespace WatchDog
                 mrects.Add(new object[] { mx, mx + mw, "pct" });
                 titleEnd = mx - 10;
             }
-            if (chartMode == "proc" && selected != null)
+            string[][] tabs = chartMode == "proc" && selected != null ? ProcMetrics : chartMode == "kernel" ? KernelMetrics : null;
+            if (tabs != null)
             {
-                int mw = 48, mx = x - 40 - ProcMetrics.Length * (mw + 4);
-                foreach (string[] m in ProcMetrics)
+                string cur = chartMode == "kernel" ? kernelMetric : procMetric;
+                int mw = chartMode == "kernel" ? 60 : 48, mx = x - 40 - tabs.Length * (mw + 4);
+                titleEnd = mx - 10;
+                foreach (string[] m in tabs)
                 {
-                    if (procMetric == m[0]) { g.FillRectangle(bAcc, mx, 7, mw, 20); Txt(g, m[1], fCNb, cBg, mx, 7, mw, 20, tfC); }
+                    if (cur == m[0]) { g.FillRectangle(bAcc, mx, 7, mw, 20); Txt(g, m[1], fCNb, cBg, mx, 7, mw, 20, tfC); }
                     else { g.DrawRectangle(pAccDim, mx, 7, mw, 20); Txt(g, m[1], fCN, cAccent, mx, 7, mw, 20, tfC); }
                     mrects.Add(new object[] { mx, mx + mw, m[0] }); mx += mw + 4;
                 }
-                titleEnd = x - 40 - ProcMetrics.Length * (mw + 4) - 10;
             }
             metricRects = mrects;
             Txt(g, data.Title, fCNb, cText, 84, 8, titleEnd - 84, 20);
@@ -840,7 +917,7 @@ namespace WatchDog
             foreach (object[] r in metricRects)
                 if (e.X >= (int)r[0] && e.X < (int)r[1])
                 {
-                    if ((string)r[2] == "pct") memPct = !memPct; else procMetric = (string)r[2];
+                    if ((string)r[2] == "pct") memPct = !memPct; else if (chartMode == "kernel") kernelMetric = (string)r[2]; else procMetric = (string)r[2];
                     chart.Invalidate(); return;
                 }
             foreach (object[] r in rangeRects)

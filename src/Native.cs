@@ -1,5 +1,6 @@
 // 系统接口和基础部件：内存 / CPU / 进程读写 / 磁盘计数器 / 服务进程号 / 环形缓存 / 双缓冲控件 / 菜单配色
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -58,13 +59,69 @@ namespace WatchDog
             return Math.Max(0, Math.Min(100, r));
         }
 
-        // 进程累计读写字节数（文件 + 其他 I/O）。拿不到返回 -1。句柄用完立即关闭。
-        public static long IoBytes(int pid)
+        // 同时拿读写字节数和 GDI / USER 对象数（只打开一次进程）。拿不到时 io = -1、gdi = user = 0
+        public static void IoAndGui(int pid, out long io, out uint gdi, out uint user)
         {
+            io = -1; gdi = 0; user = 0;
             IntPtr h = OpenProcess(QUERY_LIMITED, false, pid);
-            if (h == IntPtr.Zero) return -1;
-            try { IO_COUNTERS c; if (!GetProcessIoCounters(h, out c)) return -1; return (long)(c.ReadBytes + c.WriteBytes); }
+            if (h == IntPtr.Zero) return;
+            try
+            {
+                IO_COUNTERS c; if (GetProcessIoCounters(h, out c)) io = (long)(c.ReadBytes + c.WriteBytes);
+                gdi = GetGuiResources(h, 0); user = GetGuiResources(h, 1);
+            }
             finally { CloseHandle(h); }
+        }
+
+        // 整机：内核分页池 / 非分页池（MB）、句柄总数
+        [StructLayout(LayoutKind.Sequential)]
+        struct PERF_INFO { public int cb; public IntPtr CommitTotal, CommitLimit, CommitPeak, PhysTotal, PhysAvail, SysCache, KTotal, KPaged, KNonpaged, PageSize; public int Handles, Procs, Threads; }
+        [DllImport("psapi.dll")] static extern bool GetPerformanceInfo(out PERF_INFO p, int cb);
+        public static double[] Kernel()
+        {
+            PERF_INFO p;
+            if (!GetPerformanceInfo(out p, Marshal.SizeOf(typeof(PERF_INFO)))) return null;
+            double pg = (long)p.PageSize / 1048576.0;
+            return new double[] { (long)p.KPaged * pg, (long)p.KNonpaged * pg, p.Handles };
+        }
+
+        // 内核内存池按"标签"分开的用量（每个驱动分配内存时都会带一个 4 个字母的标签）。不需要管理员权限。
+        // 返回 标签 -> 分页 + 非分页 字节数；同时给出每个标签的非分页部分
+        [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int cls, IntPtr buf, int len, out int ret);
+        public static Dictionary<int, long[]> PoolTags()
+        {
+            int len = 256 * 1024;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                IntPtr b = Marshal.AllocHGlobal(len);
+                try
+                {
+                    int ret, st = NtQuerySystemInformation(22, b, len, out ret);   // SystemPoolTagInformation
+                    if (st == unchecked((int)0xC0000004)) { len = Math.Max(len * 2, ret + 65536); continue; }   // 缓冲区不够
+                    if (st != 0) return null;
+                    bool x64 = IntPtr.Size == 8;
+                    int n = Marshal.ReadInt32(b), sz = x64 ? 40 : 28, off0 = x64 ? 8 : 4;
+                    Dictionary<int, long[]> d = new Dictionary<int, long[]>(n);
+                    for (int i = 0; i < n; i++)
+                    {
+                        IntPtr e = b + off0 + i * sz;
+                        int tag = Marshal.ReadInt32(e);
+                        long pu = x64 ? Marshal.ReadInt64(e + 16) : Marshal.ReadInt32(e + 12);
+                        long nu = x64 ? Marshal.ReadInt64(e + 32) : Marshal.ReadInt32(e + 24);
+                        d[tag] = new long[] { pu + nu, nu };
+                    }
+                    return d;
+                }
+                finally { Marshal.FreeHGlobal(b); }
+            }
+            return null;
+        }
+        public static string TagText(int tag)
+        {
+            byte[] bs = BitConverter.GetBytes(tag);
+            StringBuilder sb = new StringBuilder(4);
+            foreach (byte c in bs) sb.Append(c >= 32 && c < 127 ? (char)c : '?');
+            return sb.ToString().TrimEnd(' ');
         }
 
         public static string ImagePath(int pid)

@@ -1,4 +1,4 @@
-# Memory-leak watchdog + history recorder for the WatchDog monitor window.
+﻿# Memory-leak watchdog + history recorder for the WatchDog monitor window.
 # Runs as a scheduled task every 10 minutes, takes a few seconds, then exits.
 # It never stays resident, so it cannot leak memory itself.
 # What to check and how to fix it comes from rules.json (shared) + rules.local.json (your own, not in git).
@@ -119,23 +119,26 @@ if (-not (Test-Path $dataDir)) { New-Item -ItemType Directory -Path $dataDir | O
 $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 $day   = (Get-Date).ToString('yyyyMMdd')
 
-# Per program (grouped by name): top 30 by memory + every process named in a rule
+# Per program (grouped by name): top 30 by memory + top 10 by handle count + every process named in a rule
 $all = Get-Process
 $groups = foreach ($g in ($all | Group-Object ProcessName)) {
-    $cpuSec = 0.0
-    foreach ($p in $g.Group) { try { $cpuSec += $p.TotalProcessorTime.TotalSeconds } catch {} }
-    [pscustomobject]@{ Time = $stamp; Name = $g.Name; PrivMB = PrivMB $g.Group; Count = $g.Count; CpuSec = [math]::Round($cpuSec, 1) }
+    $cpuSec = 0.0; $handles = 0
+    foreach ($p in $g.Group) { try { $cpuSec += $p.TotalProcessorTime.TotalSeconds } catch {}; $handles += $p.HandleCount }
+    [pscustomobject]@{ Time = $stamp; Name = $g.Name; PrivMB = PrivMB $g.Group; Count = $g.Count; CpuSec = [math]::Round($cpuSec, 1); Handles = $handles }
 }
 $ruleProcs = @($rules | ForEach-Object { $_.when.process } | Where-Object { $_ } | Sort-Object -Unique)
 $rows = @($groups | Sort-Object PrivMB -Descending | Select-Object -First 30)
 $have = @($rows | ForEach-Object { $_.Name })
 $rows += @($groups | Where-Object { $ruleProcs -contains $_.Name -and $have -notcontains $_.Name })
+$have = @($rows | ForEach-Object { $_.Name })
+$rows += @($groups | Where-Object { $have -notcontains $_.Name } | Sort-Object Handles -Descending | Select-Object -First 10)
 # Services hidden inside svchost etc. get their own row: svc:<name>
 foreach ($n in ($ruleProcs | Where-Object { $_ -like 'svc:*' })) {
     $mb = Get-TargetMB $n
-    if ($null -ne $mb) { $rows += [pscustomobject]@{ Time = $stamp; Name = $n; PrivMB = $mb; Count = 1; CpuSec = 0 } }
+    if ($null -ne $mb) { $rows += [pscustomobject]@{ Time = $stamp; Name = $n; PrivMB = $mb; Count = 1; CpuSec = 0; Handles = 0 } }
 }
-$rows | Export-Csv -Path (Join-Path $dataDir "proc-$day.csv") -Append -NoTypeInformation -Encoding UTF8
+# procv2 = proc + Handles column (a leak of handles shows up as a steady climb over hours)
+$rows | Export-Csv -Path (Join-Path $dataDir "procv2-$day.csv") -Append -NoTypeInformation -Encoding UTF8
 
 # Whole system
 $os  = Get-CimInstance Win32_OperatingSystem
@@ -143,7 +146,9 @@ $cpu = [int](Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Av
 $nvDb = 'C:\ProgramData\NVIDIA Corporation\nvtopps\nvtopps.db3'
 $dbNow = if (Test-Path $nvDb) { [int]((Get-Item $nvDb).Length / 1MB) } else { 0 }
 $disk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction SilentlyContinue
-# sysv3 = sys + disk + the watchdog's own CPU time and peak memory
+# Kernel memory pools: a driver leak shows up as paged / nonpaged pool growing for hours, invisible in the process list
+$kmem = Get-CimInstance Win32_PerfRawData_PerfOS_Memory -ErrorAction SilentlyContinue
+# sysv4 = sys + disk + the watchdog's own CPU time and peak memory + kernel pools and total handle count
 # (new file name each time columns change, because Export-Csv can't append rows with new columns to an old file)
 $self = Get-Process -Id $PID
 [pscustomobject]@{
@@ -158,7 +163,10 @@ $self = Get-Process -Id $PID
     DiskWriteMBs  = if ($disk) { [math]::Round($disk.DiskWriteBytesPersec / 1MB, 2) } else { 0 }
     SelfCpuSec    = [math]::Round($self.TotalProcessorTime.TotalSeconds, 2)
     SelfPeakMB    = [int]($self.PeakWorkingSet64 / 1MB)
+    PoolPagedMB    = if ($kmem) { [int]($kmem.PoolPagedBytes / 1MB) } else { 0 }
+    PoolNonpagedMB = if ($kmem) { [int]($kmem.PoolNonpagedBytes / 1MB) } else { 0 }
+    Handles        = [int](($all | Measure-Object HandleCount -Sum).Sum)
     RunMs         = $sw.ElapsedMilliseconds
-} | Export-Csv -Path (Join-Path $dataDir "sysv3-$day.csv") -Append -NoTypeInformation -Encoding UTF8
+} | Export-Csv -Path (Join-Path $dataDir "sysv4-$day.csv") -Append -NoTypeInformation -Encoding UTF8
 
 Get-ChildItem $dataDir -Filter '*.csv' | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$HistoryDays) } | Remove-Item -Force -ErrorAction SilentlyContinue

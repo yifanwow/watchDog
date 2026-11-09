@@ -6,7 +6,8 @@
 // 实时数据存在固定大小的环形缓存里（每条最多 1 小时 / 720 个点，最多 150 条），不会越用越大。
 //
 // 自测：WatchDog.exe --selftest --loops N [--report 文件] [--snapshot x.png] [--select 程序名]
-//        [--chart mem|cpu|disk|dog|proc] [--metric mem|cpu|io] [--range 30m|1h|3h|12h|24h] [--sim 分钟] [--rising 程序名] [--data 目录]
+//        [--chart mem|cpu|disk|kernel|dog|proc] [--metric mem|cpu|io|hnd|gui|pct|pool|total] [--range 30m|1h|3h|12h|24h]
+//        [--sim 分钟] [--rising 程序名（内存、句柄、GDI 一起涨）] [--kleak（模拟内核非分页池上涨）] [--data 目录]
 //   在屏幕外显示窗口，连续刷新并完整重绘 N 次，记录自身内存 / GDI / 句柄，看有没有泄漏
 using System;
 using System.Collections.Generic;
@@ -124,7 +125,7 @@ namespace WatchDog
                 // 在屏幕外真实显示窗口，让所有控件都按正常流程创建和绘制
                 form.StartPosition = FormStartPosition.Manual; form.Location = new Point(-5000, -5000); form.ShowInTaskbar = false;
                 form.Show(); Application.DoEvents();
-                if (sim > 0) form.Simulate(sim, Get(a, "rising", ""));
+                if (sim > 0) form.Simulate(sim, Get(a, "rising", ""), a.ContainsKey("kleak"));
                 using (Bitmap bmp = new Bitmap(form.Width, form.Height))
                 {
                     Rectangle rect = new Rectangle(0, 0, form.Width, form.Height);
@@ -161,11 +162,11 @@ namespace WatchDog
         public int IconCount { get { return icons.Count; } }
         public int SeriesCount { get { return series.Count; } }
         public void SaveLiveNow() { SaveLive(); }
-        public void SetMetric(string m) { if (m == "pct") memPct = true; else procMetric = m; }
+        public void SetMetric(string m) { if (m == "pct") memPct = true; else if (m == "pool" || m == "total") kernelMetric = m; else procMetric = m; }
         public void ForceClose() { reallyExit = true; Close(); }
 
         // 仅自测：预先填入最近 N 分钟的模拟实时数据
-        public void Simulate(int minutes, string rising)
+        public void Simulate(int minutes, string rising, bool kleak)
         {
             List<ProcRow> rows0 = SampleProcesses().Where(r => r.Name != "Idle").OrderByDescending(r => r.PrivMB).Take(40).ToList();
             int n = Math.Min(RingSize, minutes * 12); DateTime t0 = DateTime.UtcNow.AddMinutes(-minutes);
@@ -177,6 +178,13 @@ namespace WatchDog
                 Record("sys:mem", 19 + f + rnd.NextDouble() * 0.3, t); Record("sys:cpu", 20 + 15 * Math.Sin(i / 20.0) + rnd.NextDouble() * 8, t);
                 Record("sys:dr", Math.Max(0, rnd.NextDouble() * 3 - 1), t); Record("sys:dw", Math.Max(0, rnd.NextDouble() * 6 - 2 + (i % 90 < 5 ? 40 : 0)), t);
                 Record("sys:self", 40 + rnd.NextDouble() * 4, t);
+                Record("sys:kp", 1500 + rnd.NextDouble() * 20, t); Record("sys:kn", (kleak ? 700 + 400 * f : 900) + rnd.NextDouble() * 10, t); Record("sys:hnd", 200000 + rnd.NextDouble() * 3000, t);
+                foreach (ProcRow r in rows0.Where((r, j) => j < 15 || r.Name == rising))
+                {
+                    bool up = r.Name == rising;
+                    double k = up ? 0.3 + 0.7 * f : 1;   // 上涨的程序：从现在值的 30% 一路涨到现在值
+                    Record("hnd:" + r.Name, r.Handles * k + rnd.Next(30), t); Record("gdi:" + r.Name, r.Gdi * k, t); Record("usr:" + r.Name, r.User * k, t);
+                }
             }
         }
 
@@ -185,6 +193,10 @@ namespace WatchDog
         {
             foreach (BufferedPanel c in cardList) { CardData d = (CardData)c.Tag; o.AppendFormat("{0}: {1} [{2}] {3}\r\n", d.Tag, d.Value, d.Badge, d.Sub); }
             o.AppendFormat("WATCHDOG: {0} [{1}] {2}\r\n", dog.Value, dog.Badge, dog.Sub);
+            o.AppendFormat("内核: 分页 {0:N0} MB · 非分页 {1:N0} MB · 句柄 {2:N0} [{3}] {4}\r\n", kPaged, kNonpaged, kHandles, kBadge, kWhy);
+            o.AppendFormat("内存池最大: {0}\r\n", string.Join("，", poolBig.Select(t => TagLabel(t) + " " + (int)t.MB + " MB")));
+            o.AppendFormat("GDI 最多: {0}\r\n", string.Join("，", rows.Values.Where(r => !r.Name.StartsWith("svc:")).OrderByDescending(r => r.GuiMax).Take(3).Select(r => r.Name + " " + r.Gdi + "/" + r.User)));
+            o.AppendFormat("句柄最多: {0}\r\n", string.Join("，", rows.Values.Where(r => !r.Name.StartsWith("svc:")).OrderByDescending(r => r.Handles).Take(3).Select(r => r.Name + " " + r.Handles)));
             o.AppendFormat("内存 TOP: {0}\r\n", string.Join("，", ((CardData)cardMem.Tag).Top.Select(t => t.Key + " " + (int)t.Value)));
             o.AppendFormat("结论: {0} | {1}\r\n", verdict[0], verdict[2]);
             foreach (Issue i in issues) o.AppendFormat("  - [{0}] {1} | {2} | -> {3}\r\n", i.Level, i.Title, i.Sub, i.Target);

@@ -100,6 +100,7 @@ namespace WatchDog
             if (selected != null && byName.ContainsKey(selected)) rec[selected] = byName[selected];
             // 每个程序记三条：内存（键就是程序名）、CPU（cpu:程序名）、读写（io:程序名）
             foreach (ProcRow r in rec.Values) { Record(r.Name, r.PrivMB, nowU); Record("cpu:" + r.Name, r.CpuPct, nowU); Record("io:" + r.Name, r.IoMBs, nowU); }
+            RecordResources(real, nowU);
             EvalRules();
             SetMemExtra(memExtra, real.OrderByDescending(r => r.PrivMB).Take(3).Select(r => new KeyValuePair<string, double>(r.Name, r.PrivMB)).ToList());
             Dictionary<string, Rating> rts = new Dictionary<string, Rating>();
@@ -119,6 +120,15 @@ namespace WatchDog
             lvl = busyPct < 60 ? 0 : busyPct < 90 ? 1 : 2;
             SetCard(cardDisk, string.Format("R {0:N1}  W {1:N1} MB/s", rd, wr), string.Format("{0}  {1:N0}%", new[] { "正常", "较忙", "很忙" }[lvl], busyPct), lvl,
                 topIo != null && topIo.IoMBs >= 0.1 ? string.Format("读写最多：{0} {1:N1} MB/s", topIo.Name, topIo.IoMBs) : "没有程序在大量读写", busyPct);
+
+            // 内核内存池 + 句柄 / 图形资源
+            SampleKernel(nowU);
+            EvalKernel();
+            EvalResources(real);
+            lvl = kLevel;
+            SetCard(cardKernel, string.Format("{0:N1} GB", (kPaged + kNonpaged) / 1024), kBadge, lvl,
+                string.Format("分页 {0:N1} · 非分页 {1:N1} GB", kPaged / 1024, kNonpaged / 1024), -1);
+            SetCardExtra(cardKernel, string.Format("句柄 {0:N1} 万", kHandles / 10000));
 
             // 本窗口自己的占用
             using (Process me = Process.GetCurrentProcess())
@@ -149,13 +159,15 @@ namespace WatchDog
             List<ProcRow> list = real.OrderByDescending(r => r.PrivMB).Take(25).ToList();
             HashSet<string> inList = new HashSet<string>(list.Select(r => r.Name));
             foreach (ProcRow r in all)
-                if (!inList.Contains(r.Name) && (ratings[r.Name].Level >= 1 || r.IoMBs >= HeavyIoMBs || watched.ContainsKey(r.Name))) { list.Add(r); inList.Add(r.Name); }
+                if (!inList.Contains(r.Name) && (ratings[r.Name].Level >= 1 || ResLevel(r.Name) >= 1 || r.IoMBs >= HeavyIoMBs || watched.ContainsKey(r.Name))) { list.Add(r); inList.Add(r.Name); }
             switch (sortMode)
             {
                 case "mem": list = list.OrderByDescending(r => r.PrivMB).ToList(); break;
                 case "cpu": list = list.OrderByDescending(r => r.CpuPct).ToList(); break;
                 case "io": list = list.OrderByDescending(r => r.IoMBs).ToList(); break;
-                default: list = list.OrderByDescending(r => ratings[r.Name].Score + (r.IoMBs >= HeavyIoMBs ? 40 : 0)).ThenByDescending(r => r.PrivMB).ToList(); break;
+                case "hnd": list = list.OrderByDescending(r => r.Handles).ToList(); break;
+                case "gui": list = list.OrderByDescending(r => r.Gdi + r.User).ToList(); break;
+                default: list = list.OrderByDescending(r => ratings[r.Name].Score + 45 * ResLevel(r.Name) + (r.IoMBs >= HeavyIoMBs ? 40 : 0)).ThenByDescending(r => r.PrivMB).ToList(); break;
             }
             // 原地更新列表（不清空重建）：只改变了的格子，滚动位置和选中都保留，不闪
             updating = true;
@@ -167,12 +179,16 @@ namespace WatchDog
                     ProcRow r = list[i]; Rating rt = ratings[r.Name];
                     ListViewItem it;
                     if (i < lv.Items.Count) it = lv.Items[i];
-                    else { it = new ListViewItem(""); for (int k = 1; k < 8; k++) it.SubItems.Add(""); lv.Items.Add(it); }
+                    else { it = new ListViewItem(""); for (int k = 1; k < ColCount; k++) it.SubItems.Add(""); lv.Items.Add(it); }
                     string desc = DescOf(r.Name);
+                    Issue ri; resIssues.TryGetValue(r.Name, out ri);
+                    // 稳定性看内存；句柄 / 图形资源有问题时，"判断"一栏显示那个问题
+                    int lvRow = Math.Max(rt.Level, ri != null ? ri.Level : -1);
+                    string judge = ri != null && ri.Level >= rt.Level ? ShortTitle(ri, r.Name) : rt.Forecast.Length > 0 ? rt.Forecast : rt.Note;
                     string[] vals = { r.Name, desc ?? "", string.Format("{0:N0}", r.PrivMB), string.Format("{0:N1}", r.CpuPct), string.Format("{0:N1}", r.IoMBs),
-                        rt.Text, rt.Trend, rt.Forecast.Length > 0 ? rt.Forecast : rt.Note };
-                    for (int k = 0; k < 8; k++) if (it.SubItems[k].Text != vals[k]) it.SubItems[k].Text = vals[k];
-                    if (!(it.Tag is int) || (int)it.Tag != rt.Level) { it.Tag = rt.Level; lv.Invalidate(it.Bounds); }
+                        string.Format("{0:N0}", r.Handles), r.Gdi + r.User > 0 ? r.Gdi + "/" + r.User : "-", rt.Text, rt.Trend, judge };
+                    for (int k = 0; k < ColCount; k++) if (it.SubItems[k].Text != vals[k]) it.SubItems[k].Text = vals[k];
+                    if (!(it.Tag is int) || (int)it.Tag != lvRow) { it.Tag = lvRow; lv.Invalidate(it.Bounds); }
                     bool sel = r.Name == selected;
                     if (it.Selected != sel) it.Selected = sel;
                 }
@@ -210,6 +226,9 @@ namespace WatchDog
                     if (st != null && st[2] >= 100) list.Add(NewIssue(label + " 在上涨（观察中）", rt.Note, 1, r.Name, "prog:" + r.Name));
                 }
             }
+            if (kernelIssue != null) list.Add(kernelIssue);
+            foreach (Issue ri in resIssues.Values.OrderByDescending(i => i.Level).Take(3))
+                if (!seen.Contains(ri.Target)) { list.Add(ri); seen.Add(ri.Target); }
             foreach (ProcRow r in real.Where(x => x.IoMBs >= HeavyIoMBs).OrderByDescending(x => x.IoMBs).Take(2))
             {
                 if (IsIgnored("io:" + r.Name) != null || seen.Contains(r.Name)) continue;
@@ -356,7 +375,8 @@ namespace WatchDog
             foreach (ProcRow r in rows.Values)
             {
                 if (seen.Contains(r.Name) || Protected.Contains(r.Name)) continue;
-                Rating rt; if (ratings.TryGetValue(r.Name, out rt) && rt.Text == "疑似泄漏" && rt.Level >= 2) { todo.Add(new KeyValuePair<string, object>("重启 " + r.Name + "（疑似泄漏）", r.Name)); seen.Add(r.Name); }
+                Rating rt; if (ratings.TryGetValue(r.Name, out rt) && rt.Text == "疑似泄漏" && rt.Level >= 2) { todo.Add(new KeyValuePair<string, object>("重启 " + r.Name + "（疑似泄漏）", r.Name)); seen.Add(r.Name); continue; }
+                if (ResLevel(r.Name) >= 2 && !r.Name.StartsWith("svc:")) { todo.Add(new KeyValuePair<string, object>("重启 " + r.Name + "（句柄 / 图形资源）", r.Name)); seen.Add(r.Name); }
             }
             if (todo.Count == 0) { Say("现在没有需要修复的问题。"); return; }
             if (!Ask("将依次执行：\n\n  " + string.Join("\n  ", todo.Select(t => t.Key)) + "\n\n相关程序里没保存的内容可能会丢失；部分操作需要管理员权限。确定吗？")) return;
@@ -453,6 +473,7 @@ namespace WatchDog
             if (name == null) return null;
             Hit hit; if (hitByTarget.TryGetValue(name, out hit)) return new[] { "rule:" + hit.Rule.Id, hit.Rule.Title };
             Rating rt; if (ratings.TryGetValue(name, out rt) && rt.Level >= 1) return new[] { "prog:" + name, name + " " + rt.Text };
+            Issue ri; if (resIssues.TryGetValue(name, out ri)) return new[] { ri.Key, ri.Title };
             ProcRow r; if (rows.TryGetValue(name, out r) && r.IoMBs >= HeavyIoMBs && IsIgnored("io:" + name) == null) return new[] { "io:" + name, name + " 正在大量读写" };
             return null;
         }

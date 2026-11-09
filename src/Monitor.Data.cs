@@ -9,7 +9,11 @@ using System.Linq;
 
 namespace WatchDog
 {
-    class ProcRow { public string Name; public int Pid; public double PrivMB, CpuMs, IoB, CpuPct, IoMBs; public int Count; }
+    class ProcRow
+    {
+        public string Name; public int Pid; public double PrivMB, CpuMs, IoB, CpuPct, IoMBs; public int Count;
+        public int Handles, HMax, Gdi, User, GuiMax;   // 句柄（合计 / 单个进程最多）、GDI / USER 对象（合计）、单个进程 GDI 或 USER 最多
+    }
     class Rating
     {
         public string Text, Note, Forecast, Trend; public int Level, Score;
@@ -39,7 +43,7 @@ namespace WatchDog
     class Issue { public string Title, Sub, Target, Key; public int Level; }
     class HistPt { public DateTime T; public double MB; }
     class Trend { public double Slope, R2, Growth, Span, Cv; }
-    class SysRow { public DateTime T; public double UsedMB, CpuPct, RunMs, SelfCpuSec, SelfPeakMB, DiskR, DiskW; public bool HasDisk, HasSelf; }
+    class SysRow { public DateTime T; public double UsedMB, CpuPct, RunMs, SelfCpuSec, SelfPeakMB, DiskR, DiskW, PoolP, PoolN, Handles; public bool HasDisk, HasSelf, HasKernel; }
     class IgnoreEntry { public string Key, Label, Type, Until; }
 
     partial class Monitor
@@ -83,7 +87,7 @@ namespace WatchDog
         const double HeavyIoMBs = 30;   // 单个程序读写超过这个速度会提示
         const int RingSize = 720;       // 每条实时数据最多 720 个点（5 秒一个 = 1 小时）
         const double GapSec = 1800;     // 实时数据中断超过 30 分钟，当作程序重启过，只看中断之后的数据
-        const int MaxSeries = 240;      // 最多同时记录 240 条（每个程序 内存 / CPU / 读写 各一条）
+        const int MaxSeries = 320;      // 最多同时记录 320 条（每个程序 内存 / CPU / 读写 各一条，句柄多的程序再加 句柄 / GDI）
         const int MaxIcons = 150;
 
         // ---------- 状态（每次刷新都整体替换，不累积） ----------
@@ -94,6 +98,8 @@ namespace WatchDog
         Queue<double> cpuHist = new Queue<double>();
         Dictionary<string, List<HistPt>> hist = new Dictionary<string, List<HistPt>>();
         Dictionary<string, Trend> analysis = new Dictionary<string, Trend>();
+        Dictionary<string, List<HistPt>> histH = new Dictionary<string, List<HistPt>>();   // 各程序句柄数的长期记录（procv2 起才有）
+        Dictionary<string, Trend> analysisH = new Dictionary<string, Trend>();
         List<SysRow> sys = new List<SysRow>();
         string histSig = "", rulesSig = "";
         long ignoreSig = -1;
@@ -157,15 +163,16 @@ namespace WatchDog
         {
             if (!Directory.Exists(DataDir)) { hist = new Dictionary<string, List<HistPt>>(); analysis = new Dictionary<string, Trend>(); sys = new List<SysRow>(); return; }
             DirectoryInfo di = new DirectoryInfo(DataDir);
-            FileInfo[] pf = di.GetFiles("proc-*.csv").OrderBy(f => f.Name).ToArray();
-            pf = pf.Skip(Math.Max(0, pf.Length - 2)).ToArray();
+            // proc-*.csv（旧）和 procv2-*.csv（多了句柄列）：取最近写过的 3 个文件，够覆盖 24 小时
+            FileInfo[] pf = di.GetFiles("proc*.csv").OrderBy(f => f.LastWriteTime).ToArray();
+            pf = pf.Skip(Math.Max(0, pf.Length - 3)).ToArray();
             FileInfo[] sf = di.GetFiles("sys*.csv").OrderBy(f => f.LastWriteTime).ToArray();
             sf = sf.Skip(Math.Max(0, sf.Length - 4)).ToArray();
             string sig = string.Join("|", pf.Concat(sf).Select(f => f.Name + ":" + f.Length));
             if (sig == histSig) return;   // 文件没变就不重读
             histSig = sig;
             DateTime cut = DateTime.Now.AddHours(-24);
-            Dictionary<string, List<HistPt>> h = new Dictionary<string, List<HistPt>>();
+            Dictionary<string, List<HistPt>> h = new Dictionary<string, List<HistPt>>(), hh = new Dictionary<string, List<HistPt>>();
             foreach (FileInfo f in pf)
                 foreach (Dictionary<string, string> r in Csv.Read(f.FullName))
                 {
@@ -173,11 +180,15 @@ namespace WatchDog
                     if (t == null || t.Value < cut || !r.TryGetValue("Name", out name)) continue;
                     List<HistPt> l; if (!h.TryGetValue(name, out l)) { l = new List<HistPt>(); h[name] = l; }
                     HistPt p = new HistPt(); p.T = t.Value; p.MB = Csv.Num(r, "PrivMB", 0); l.Add(p);
+                    if (!Csv.Has(r, "Handles")) continue;
+                    if (!hh.TryGetValue(name, out l)) { l = new List<HistPt>(); hh[name] = l; }
+                    p = new HistPt(); p.T = t.Value; p.MB = Csv.Num(r, "Handles", 0); l.Add(p);
                 }
-            Dictionary<string, Trend> a = new Dictionary<string, Trend>();
+            Dictionary<string, Trend> a = new Dictionary<string, Trend>(), ah = new Dictionary<string, Trend>();
             foreach (KeyValuePair<string, List<HistPt>> kv in h) { kv.Value.Sort((x, y) => x.T.CompareTo(y.T)); Trend tr = Analyze(kv.Value); if (tr != null) a[kv.Key] = tr; }
-            hist = h; analysis = a;
-            // sys-*.csv（旧格式）、sysv2（多了磁盘列）、sysv3（多了看门狗自身占用）合并，按时间排序
+            foreach (KeyValuePair<string, List<HistPt>> kv in hh) { kv.Value.Sort((x, y) => x.T.CompareTo(y.T)); Trend tr = Analyze(kv.Value); if (tr != null) ah[kv.Key] = tr; }
+            hist = h; analysis = a; histH = hh; analysisH = ah;
+            // sys-*.csv（旧格式）、sysv2（多了磁盘列）、sysv3（多了看门狗自身占用）、sysv4（多了内核内存池和句柄总数）合并，按时间排序
             List<SysRow> s = new List<SysRow>();
             foreach (FileInfo f in sf)
                 foreach (Dictionary<string, string> r in Csv.Read(f.FullName))
@@ -188,6 +199,7 @@ namespace WatchDog
                     x.UsedMB = Csv.Num(r, "UsedMB", 0); x.CpuPct = Csv.Num(r, "CpuPct", 0); x.RunMs = Csv.Num(r, "RunMs", 0);
                     x.HasDisk = Csv.Has(r, "DiskWriteMBs"); x.DiskR = Csv.Num(r, "DiskReadMBs", 0); x.DiskW = Csv.Num(r, "DiskWriteMBs", 0);
                     x.HasSelf = Csv.Has(r, "SelfPeakMB"); x.SelfCpuSec = Csv.Num(r, "SelfCpuSec", 0); x.SelfPeakMB = Csv.Num(r, "SelfPeakMB", 0);
+                    x.HasKernel = Csv.Has(r, "PoolNonpagedMB"); x.PoolP = Csv.Num(r, "PoolPagedMB", 0); x.PoolN = Csv.Num(r, "PoolNonpagedMB", 0); x.Handles = Csv.Num(r, "Handles", 0);
                     s.Add(x);
                 }
             s.Sort((x, y) => x.T.CompareTo(y.T));
@@ -310,14 +322,16 @@ namespace WatchDog
                         catch { newDenied.Add(id); }
                     }
                     else newDenied.Add(id);
-                    long io = Native.IoBytes(id);
+                    long io; uint gdi, usr; Native.IoAndGui(id, out io, out gdi, out usr);
                     if (io >= 0) { curIo[id] = io; long pio; if (prevIo.TryGetValue(id, out pio)) dio = Math.Max(0, io - pio); }
+                    int hc = 0; try { hc = p.HandleCount; } catch { }
                     string svc; svcPid.TryGetValue(id, out svc);
                     foreach (string nm in svc == null ? new[] { p.ProcessName } : new[] { p.ProcessName, svc })
                     {
                         ProcRow e;
                         if (!byName.TryGetValue(nm, out e)) { e = new ProcRow(); e.Name = nm; e.Pid = id; byName[nm] = e; }
                         e.PrivMB += priv; e.CpuMs += d; e.IoB += dio; e.Count++;
+                        e.Handles += hc; e.HMax = Math.Max(e.HMax, hc); e.Gdi += (int)gdi; e.User += (int)usr; e.GuiMax = Math.Max(e.GuiMax, (int)Math.Max(gdi, usr));
                     }
                 }
                 catch { }
@@ -428,7 +442,7 @@ namespace WatchDog
         void UnignoreName(string name)
         {
             foreach (string k in ignores.Keys.ToList())
-                if (k == "prog:" + name || k == "io:" + name || RuleTargets(k, name)) ignores.Remove(k);
+                if (k == "prog:" + name || k == "io:" + name || k == "res:" + name || RuleTargets(k, name)) ignores.Remove(k);
             SaveIgnores(); RefreshAll();
         }
         static string IgnoreNote(IgnoreEntry i)
@@ -441,7 +455,7 @@ namespace WatchDog
             foreach (string k in ignores.Keys)
             {
                 if (IsIgnored(k) == null) continue;
-                if (k == "prog:" + name || k == "io:" + name || RuleTargets(k, name)) return true;
+                if (k == "prog:" + name || k == "io:" + name || k == "res:" + name || RuleTargets(k, name)) return true;
             }
             return false;
         }
