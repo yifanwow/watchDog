@@ -158,6 +158,8 @@ namespace WatchDog
             StartPosition = FormStartPosition.CenterScreen;
             Font = fCN; BackColor = cBg; ForeColor = cText;
             try { formIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); Icon = formIcon; } catch { }
+            // 标题栏左上角不画图标（下面的标题条里已经有 logo），任务栏 / Alt+Tab / 托盘照样用这个图标
+            HandleCreated += delegate { Native.HideCaptionIcon(Handle); };
 
             // 顶部标题条
             header = new BufferedPanel(); header.Dock = DockStyle.Top; header.Height = 50;
@@ -1075,10 +1077,10 @@ namespace WatchDog
             ToolStripMenuItem i = new ToolStripMenuItem(text); i.ForeColor = cText; i.Click += onClick; m.Items.Add(i); return i;
         }
 
-        // ---------- 托盘：点关闭 / 最小化都缩到托盘，在后台继续记录 ----------
+        // ---------- 托盘：图标一直在托盘里；点关闭 / 最小化只是把窗口藏起来，在后台继续记录 ----------
         void BuildTray()
         {
-            tray = new NotifyIcon(); tray.Icon = formIcon ?? SystemIcons.Application; tray.Text = "WatchDog"; tray.Visible = false;
+            tray = new NotifyIcon(); tray.Icon = formIcon ?? SystemIcons.Application; tray.Text = "WatchDog"; tray.Visible = true;
             trayMenu = new ContextMenuStrip(); trayMenu.Renderer = menu.Renderer; trayMenu.Font = fCN;
             ToolStripMenuItem open = MenuItem(trayMenu, "打开 WatchDog", delegate { ShowFromTray(); }); open.Font = fCNb;
             MenuItem(trayMenu, "退出", delegate { reallyExit = true; Close(); });
@@ -1097,14 +1099,14 @@ namespace WatchDog
         }
         void HideToTray()
         {
-            Hide(); tray.Visible = true;
+            Hide();
             if (!trayTipShown) { trayTipShown = true; tray.ShowBalloonTip(3000, "WatchDog 在托盘里继续记录", "点托盘图标重新打开。要退出：右键托盘图标 → 退出。", ToolTipIcon.Info); }
         }
         void ShowFromTray()
         {
+            bool wasHidden = !Visible;
             Show(); WindowState = lastState; Activate();
-            if (tray != null) tray.Visible = false;
-            RefreshAll();
+            if (wasHidden) RefreshAll();
         }
 
         protected override void Dispose(bool disposing)
