@@ -152,13 +152,7 @@ namespace WatchDog
             finally { CloseServiceHandle(scm); }
         }
 
-        // 标题栏不画图标、但窗口仍有图标（任务栏要用）：WTA_NONCLIENT + WTNCA_NODRAWICON
-        [StructLayout(LayoutKind.Sequential)] struct WTA_OPTIONS { public uint Flags, Mask; }
-        [DllImport("uxtheme.dll")] static extern int SetWindowThemeAttribute(IntPtr h, int type, ref WTA_OPTIONS o, int size);
-        public static void HideCaptionIcon(IntPtr h)
-        {
-            try { WTA_OPTIONS o = new WTA_OPTIONS(); o.Flags = 2; o.Mask = 2; SetWindowThemeAttribute(h, 1, ref o, 8); } catch { }
-        }
+        [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
 
         public static void Dwm(IntPtr h, int attr, int val) { try { DwmSetWindowAttribute(h, attr, ref val, 4); } catch { } }
     }

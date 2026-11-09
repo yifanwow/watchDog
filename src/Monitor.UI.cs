@@ -158,8 +158,13 @@ namespace WatchDog
             StartPosition = FormStartPosition.CenterScreen;
             Font = fCN; BackColor = cBg; ForeColor = cText;
             try { formIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); Icon = formIcon; } catch { }
-            // 标题栏左上角不画图标（下面的标题条里已经有 logo），任务栏 / Alt+Tab / 托盘照样用这个图标
-            HandleCreated += delegate { Native.HideCaptionIcon(Handle); };
+            // 标题栏左上角用原来的字母 W 图标（小图标）；任务栏 / Alt+Tab / 托盘用小狗（大图标、exe 图标）
+            EventHandler capIcon = delegate
+            {
+                if (capIconH == IntPtr.Zero) capIconH = LetterIcon(SystemInformation.SmallIconSize.Width);
+                if (capIconH != IntPtr.Zero) Native.SendMessage(Handle, 0x80, IntPtr.Zero, capIconH);   // WM_SETICON, ICON_SMALL
+            };
+            HandleCreated += capIcon; Shown += capIcon;
 
             // 顶部标题条
             header = new BufferedPanel(); header.Dock = DockStyle.Top; header.Height = 50;
@@ -255,6 +260,30 @@ namespace WatchDog
         Panel Spacer(int h, DockStyle dock = DockStyle.Top) { Panel p = new Panel(); p.Dock = dock; p.Height = h; p.BackColor = cBg; return p; }
 
         // ---------- 标题条 ----------
+        // 标题栏用的字母 W 小图标：红黑底、珊瑚红切角框、荧光蓝 W（和最早的程序图标一样）
+        IntPtr capIconH;
+        static IntPtr LetterIcon(int s)
+        {
+            using (Bitmap b = new Bitmap(s, s))
+            {
+                using (Graphics g = Graphics.FromImage(b))
+                using (SolidBrush bg = new SolidBrush(Color.FromArgb(32, 13, 17)))
+                using (Pen pen = new Pen(Color.FromArgb(255, 95, 87), Math.Max(1f, s * 0.05f)))
+                using (SolidBrush cyan = new SolidBrush(Color.FromArgb(94, 246, 255)))
+                using (SolidBrush red = new SolidBrush(Color.FromArgb(255, 40, 60)))
+                using (Font f = new Font("Bahnschrift SemiBold", s * 0.52f, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (StringFormat fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias; g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                    float c = s * 0.22f, m = Math.Max(1f, s * 0.04f);
+                    PointF[] pts = { new PointF(m, m), new PointF(s - m - c, m), new PointF(s - m, m + c), new PointF(s - m, s - m), new PointF(m + c / 2, s - m), new PointF(m, s - m - c / 2) };
+                    g.FillPolygon(bg, pts); g.DrawPolygon(pen, pts);
+                    g.DrawString("W", f, cyan, new RectangleF(0, s * 0.02f, s, s), fmt);
+                    if (s >= 32) { float d = s * 0.12f; g.FillRectangle(red, s * 0.14f, s * 0.14f, d, d); }
+                }
+                try { return b.GetHicon(); } catch { return IntPtr.Zero; }
+            }
+        }
         // 小狗 logo：按网站图标（favicon.svg，64×64）画出来，只画一次缓存成位图
         Bitmap logo;
         static Bitmap DogLogo(int size)
@@ -1124,6 +1153,7 @@ namespace WatchDog
                 if (formIcon != null) formIcon.Dispose();
                 if (avatar != null) avatar.Dispose();
                 if (logo != null) logo.Dispose();
+                if (capIconH != IntPtr.Zero) { Native.DestroyIcon(capIconH); capIconH = IntPtr.Zero; }
             }
             base.Dispose(disposing);
             if (disposing) { foreach (IDisposable o in gdi) o.Dispose(); gdi.Clear(); }   // 控件都释放后再释放字体和画刷
