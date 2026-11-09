@@ -241,7 +241,7 @@ namespace WatchDog
             };
         }
 
-        static readonly string[][] Links = { new[] { "YIFANOVO.COM", "https://yifanovo.com" }, new[] { "GITHUB // WATCHDOG", "https://github.com/yifanwow/watchDog" } };
+        static readonly string[][] Links = { new[] { "YIFANOVO.COM", "https://yifanovo.com" }, new[] { "WATCHDOG.YIFANOVO.COM", "https://watchdog.yifanovo.com" } };
         List<object[]> linkRects = new List<object[]>();   // [x0, x1, url]
         string hoverLink;
         string LinkAt(Point p)
@@ -253,31 +253,60 @@ namespace WatchDog
         Panel Spacer(int h, DockStyle dock = DockStyle.Top) { Panel p = new Panel(); p.Dock = dock; p.Height = h; p.BackColor = cBg; return p; }
 
         // ---------- 标题条 ----------
+        // 小狗 logo：按网站图标（favicon.svg，64×64）画出来，只画一次缓存成位图
+        Bitmap logo;
+        static Bitmap DogLogo(int size)
+        {
+            Bitmap b = new Bitmap(size, size);
+            using (Graphics g = Graphics.FromImage(b))
+            using (GraphicsPath bg = new GraphicsPath())
+            using (SolidBrush fill = new SolidBrush(Color.FromArgb(11, 14, 19)))
+            using (Pen red = new Pen(Color.FromArgb(250, 76, 89), 3.2f))
+            using (Pen cyan = new Pen(Color.FromArgb(150, 250, 255), 3f))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.ScaleTransform(size / 64f, size / 64f);
+                const float r = 22;   // 圆角 rx = 11
+                bg.AddArc(0, 0, r, r, 180, 90); bg.AddArc(64 - r, 0, r, r, 270, 90);
+                bg.AddArc(64 - r, 64 - r, r, r, 0, 90); bg.AddArc(0, 64 - r, r, r, 90, 90); bg.CloseFigure();
+                g.FillPath(fill, bg);
+                red.LineJoin = LineJoin.Bevel; cyan.LineJoin = LineJoin.Bevel;
+                g.DrawPolygon(red, new[] { new PointF(10, 26), new PointF(10, 10), new PointF(24, 20), new PointF(40, 20), new PointF(54, 10), new PointF(54, 26), new PointF(47, 51), new PointF(17, 51) });
+                g.DrawLines(cyan, new[] { new PointF(21, 33), new PointF(31, 38), new PointF(21, 42) });
+                g.DrawLines(cyan, new[] { new PointF(43, 33), new PointF(33, 38), new PointF(43, 42) });
+                g.DrawLine(cyan, 30, 48, 34, 48);
+            }
+            return b;
+        }
         void PaintHeader(object s, PaintEventArgs e)
         {
             Graphics g = e.Graphics; int w = header.Width, h = header.Height;
             g.FillRectangle(bBg, 0, 0, w, h);
             Scanlines(g, w, h);
+            // 小狗 logo（和网站 watchdog.yifanovo.com 的图标一样）
+            if (logo == null) logo = DogLogo(32);
+            g.DrawImage(logo, 12, 8, 32, 32);
             // 标题：红色错位的"故障"重影 + 荧光蓝本体
-            if (tick % 6 == 3) Txt(g, "WATCHDOG", fHead, cRed, 19, 8, 200, 34);
-            else Txt(g, "WATCHDOG", fHead, cRedDim, 18, 7, 200, 34);
-            Txt(g, "WATCHDOG", fHead, cCyan, 16, 6, 200, 34);
-            Txt(g, "// Which dream is your want", fTagB, cAccent, 152, 6, 260, 34);
+            const int tx = 50, dx = tx - 16;   // logo 占的宽度，后面的东西整体右移
+            if (tick % 6 == 3) Txt(g, "WATCHDOG", fHead, cRed, tx + 3, 8, 200, 34);
+            else Txt(g, "WATCHDOG", fHead, cRedDim, tx + 2, 7, 200, 34);
+            Txt(g, "WATCHDOG", fHead, cCyan, tx, 6, 200, 34);
+            Txt(g, "// Which dream is your want", fTagB, cAccent, 152 + dx, 6, 260, 34);
             // 条形码 + 信号格（条形码每次刷新变一点，像在传数据）
-            int bx = 420; uint seed = (uint)(tick * 2654435761u);
+            int bx = 420 + dx; uint seed = (uint)(tick * 2654435761u);
             for (int i = 0; i < 26; i++)
             {
                 seed = seed * 1103515245u + 12345u; int bw = 1 + (int)((seed >> 16) % 3);
-                if (bx + bw > 520) break;
+                if (bx + bw > 520 + dx) break;
                 g.FillRectangle(i % 5 == 0 ? bAcc : bDimLine, bx, 12, bw, 24); bx += bw + 2;
             }
-            Txt(g, string.Format("0x{0:X4}", (seed >> 8) & 0xFFFF), fMono, cRedDim, 420, 36, 100, 12);
+            Txt(g, string.Format("0x{0:X4}", (seed >> 8) & 0xFFFF), fMono, cRedDim, 420 + dx, 36, 100, 12);
             int[] sig = { 6, 10, 14, 18, 22 };
             int lit = 3 + tick % 3;
-            for (int i = 0; i < sig.Length; i++) g.FillRectangle(i < lit ? bLv[0] : bDim, 534 + i * 7, 36 - sig[i], 4, sig[i]);
+            for (int i = 0; i < sig.Length; i++) g.FillRectangle(i < lit ? bLv[0] : bDim, 534 + dx + i * 7, 36 - sig[i], 4, sig[i]);
             string selfTxt = string.Format("本窗口 {0:N0} MB · CPU {1:N1}%", selfMB, selfCpu);
             // 两个跳转链接：个人主页 / 软件主页
-            int lx = 596; List<object[]> lr = new List<object[]>();
+            int lx = 596 + dx; List<object[]> lr = new List<object[]>();
             foreach (string[] k in Links)
             {
                 int lw = TxtW(g, k[0], fTagB) + 30;
@@ -1092,6 +1121,7 @@ namespace WatchDog
                 icons.Clear();
                 if (formIcon != null) formIcon.Dispose();
                 if (avatar != null) avatar.Dispose();
+                if (logo != null) logo.Dispose();
             }
             base.Dispose(disposing);
             if (disposing) { foreach (IDisposable o in gdi) o.Dispose(); gdi.Clear(); }   // 控件都释放后再释放字体和画刷
